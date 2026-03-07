@@ -145,47 +145,31 @@ end
 
 -- DrawTrajectory: кубический Безье с боковым смещением для Магнус-эффекта.
 -- P0=start, P3=land (красный куб), P1/P2 = управляющие точки для подъёма + Magnus curl.
--- spinStr: "Left" = мяч летит вправо, "Right" = мяч летит влево (инверсия в игре).
-local function DrawTrajectory(startPos, peakPos, endPos, spinStr, peakFrac)
+local function DrawTrajectory(startPos, peakPos, endPos, peakFrac)
     if not peakPos or not endPos then
         for _, l in ipairs(TrajectoryLines) do l.Visible = false end; return
     end
 
-    local fwd = endPos - startPos
-    fwd = Vector3.new(fwd.X, 0, fwd.Z)
-    if fwd.Magnitude < 0.1 then fwd = Vector3.new(1,0,0) end
-    fwd = fwd.Unit
-    local right = Vector3.new(-fwd.Z, 0, fwd.X)
-
-    -- Peak fraction берём из реальной баллистики (tPeak / flightTime), а не из середины.
-    -- Доп. bias слегка сдвигает начало падения раньше, ближе к игровому мячу.
-    local f = math.clamp((peakFrac or 0.40) * VIS_FALL_EARLY_BIAS, 0.18, 0.72)
-    local denom = math.max(2 * f * (1 - f), 1e-4)
-    local Pc = (peakPos - startPos * ((1-f)*(1-f)) - endPos * (f*f)) / denom
-
-    -- Асимметричный Magnus bump с пиком раньше середины.
-    -- bump(t)=t*(1-t)^a, где a=(1/p)-1 и p=VIS_CURL_PEAK. Нормируем до 1.
-    local spinSign = (spinStr == "Right") and -1 or (spinStr == "Left") and 1 or 0
-    local p = VIS_CURL_PEAK
-    local a = (1 / p) - 1
-    local bumpPeak = p * ((1 - p) ^ a)
-    local function curlBump(t)
-        if t <= 0 or t >= 1 or spinSign == 0 then return 0 end
-        return (t * ((1 - t) ^ a)) / math.max(bumpPeak, 1e-4)
-    end
-
-    local function point(t)
-        local mt  = 1 - t
-        local arc = startPos*(mt*mt) + Pc*(2*mt*t) + endPos*(t*t)
-        local curl = right * (spinSign * VIS_CURL_MAX * curlBump(t))
-        return arc + curl
-    end
+    -- Квадратичный Безье: start → Pc (контрольная) → end.
+    -- peakPos уже смещён в направлении аима (деривация спина сдвигает его в сторону).
+    -- endPos = idealPos = куда мяч реально прилетит.
+    -- Эти два факта вместе дают ЕСТЕСТВЕННУЮ кривую спина без дополнительных слоёв.
+    --
+    -- f = параметр t в котором находится peakPos.
+    -- Зажат в [0.28, 0.58] чтобы Pc не улетал в бесконечность при очень малом f
+    -- (плоские удары на близкой дистанции, где tPeak << flightTime).
+    local f = math.clamp(peakFrac or 0.40, 0.28, 0.58)
+    local Pc = (peakPos - startPos * ((1-f)^2) - endPos * (f^2))
+               / math.max(2 * f * (1-f), 1e-4)
 
     for i = 1, TRAJ_SEGMENTS do
         local t0 = (i-1) / TRAJ_SEGMENTS
         local t1 = i / TRAJ_SEGMENTS
-        local p0 = point(t0)
-        local p1 = point(t1)
+        local function bz(t)
+            local mt = 1-t
+            return startPos*(mt*mt) + Pc*(2*mt*t) + endPos*(t*t)
+        end
+        local p0 = bz(t0); local p1 = bz(t1)
         local s0, v0 = Camera:WorldToViewportPoint(p0)
         local s1, v1 = Camera:WorldToViewportPoint(p1)
         local l = TrajectoryLines[i]
@@ -610,16 +594,27 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             --   "Right" label → мяч летит ВЛЕВО (Магнус)
             --   "Left"  label → мяч летит ВПРАВО
             -- Поэтому: GK справа → хотим огнуть ВЛЕВО → шлём "Right" на сервер
-            if dist > 65 and gkDist2D < 5.5 then
+            -- a) GK рядом с целью → огибаем в обратную от него сторону
+            if dist > 60 and gkDist2D < 5.5 then
                 spinDir = (gkX > localX) and "Right" or "Left"
-                score   = score + 2.0
-            elseif dist > 105 then
+                score   = score + 3.5
+
+            -- b) Угол (любой) при dist > 50 → закручиваем В угол (curl into post).
+            --    "Left" label огибает вправо → для правого угла мяч курлится к стойке.
+            --    Даёт эффект "залетает с края" — сложнее взять GK.
+            elseif dist > 50 and isCorner then
+                spinDir = (localX >= 0) and "Left" or "Right"
+                score   = score + 2.5  -- бонус за закрученный угол
+
+            -- c) Дальние дистанции: всегда добавляем спин (сложнее для GK)
+            elseif dist > 90 then
                 local goalDir  = (GoalCFrame.Position - startPos).Unit
                 local fwdDir   = HumanoidRootPart.CFrame.LookVector
                 local fwdAngle = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
-                if fwdAngle < 20 then
-                    -- "Right" огибает влево → для цели слева используем "Right" чтобы закрутить туда
+                -- Без жёсткой проверки угла — применяем спин почти всегда на дальних
+                if fwdAngle < 40 then
                     spinDir = localX >= 0 and "Left" or "Right"
+                    score   = score + 1.5
                 end
             end
 
@@ -901,7 +896,7 @@ local function CalculateTarget()
     -- 🟢 Зелёный = AimPoint: куда направлен ствол/прицел
     -- 🟡 Жёлтый  = PeakPoint: реальный пик дуги
     -- 🟠 Оранж.  = TrajectoryLines: предикт траектории
-    PredictedLand    = result.shootPos
+    PredictedLand    = result.idealPos
     AimPoint         = result.aimPoint
     CurrentFlightTime = result.flightTime
     CurrentLaunchDir  = result.launchDir
@@ -1079,7 +1074,7 @@ AutoShoot.Start = function()
 
         -- 🟠 Траектория дуги (оранжевые линии) — главный визуал
         if hasTarget and CurrentLaunchDir and CurrentFlightTime > 0 then
-            DrawTrajectory(GetBallStartPos(), CurrentPeakPos, PredictedLand, CurrentSpin, CurrentPeakFrac)
+            DrawTrajectory(GetBallStartPos(), CurrentPeakPos, PredictedLand, CurrentPeakFrac)
         else
             for _, l in ipairs(TrajectoryLines) do l.Visible = false end
         end
