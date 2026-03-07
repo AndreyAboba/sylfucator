@@ -1,6 +1,6 @@
 -- [v3.1] AUTO DRIBBLE + AUTO TACKLE
-print('6')
 local Players = game:GetService("Players")
+print('7')
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -62,7 +62,7 @@ local AutoDribbleConfig = {
     Enabled = false,
     MaxDribbleDistance = 30,
     DribbleActivationDistance = 16,
-    MinAngleForDribble = 30,      -- Минимальный угол атаки такля в нас (чем меньше — строже)
+    MinAngleForDribble = 36,      -- Минимальный угол атаки такля в нас (чем меньше — строже)
     HeadOnAngleThreshold = 45,    -- Угол для "head-on" детекции
 }
 
@@ -199,41 +199,50 @@ local function CalcInterceptTime(fromPos, targetPos, vel, speed)
     return math.clamp(t, 0.02, 0.5)
 end
 
+-- Вычисляет предиктованную позицию. Не обновляет GUI — GUI обновляется отдельно каждый кадр.
 local function PredictTargetPosition(ownerRoot, player)
     if not ownerRoot then return ownerRoot.Position end
-    -- НЕ записываем здесь — записываем в PrecomputePlayers каждый кадр
 
-    local ping  = AutoTackleStatus.Ping
-    local vel   = GetPositionBasedVelocity(player)
+    local ping    = AutoTackleStatus.Ping
+    local vel     = GetPositionBasedVelocity(player)
     local flatVel = Vector3.new(vel.X, 0, vel.Z)
 
-    -- Шаг 1: компенсация пинга — враг уже ушёл вперёд на ping секунд
+    -- Компенсация пинга: враг уже ушёл вперёд
     local serverPos = ownerRoot.Position + flatVel * ping
 
-    -- Шаг 2: intercept — куда лететь чтобы встретиться
-    local myPos2D   = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
-    local target2D  = Vector3.new(serverPos.X, 0, serverPos.Z)
-    local flatVel2D = Vector3.new(flatVel.X, 0, flatVel.Z)
+    local myPos2D  = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
+    local target2D = Vector3.new(serverPos.X, 0, serverPos.Z)
 
-    local interceptT = CalcInterceptTime(myPos2D, target2D, flatVel2D, AutoTackleConfig.TackleSpeed)
+    local interceptT = CalcInterceptTime(myPos2D, target2D, flatVel, AutoTackleConfig.TackleSpeed)
 
-    -- Предсказанная точка перехвата (Y берём от serverPos)
-    local predictedPos = Vector3.new(
+    return Vector3.new(
         serverPos.X + flatVel.X * interceptT,
         serverPos.Y,
         serverPos.Z + flatVel.Z * interceptT
     )
+end
 
-    if Gui and AutoTackleConfig.Enabled then
-        Gui.PredictionLabel.Text = string.format(
-            "Pred: ping=%.0fms t=%.0fms v=%.1f",
-            ping * 1000,
-            interceptT * 1000,
-            flatVel.Magnitude
-        )
+-- Обновляет PredictionLabel каждый кадр для текущего owner.
+-- Вызывается из основного Heartbeat-цикла, НЕ только при такле.
+local function UpdatePredictionLabel(ownerRoot, player)
+    if not Gui or not AutoTackleConfig.Enabled then return end
+    if not ownerRoot or not player then
+        Gui.PredictionLabel.Text = "Pred: no target"
+        return
     end
-
-    return predictedPos
+    local ping    = AutoTackleStatus.Ping
+    local vel     = GetPositionBasedVelocity(player)
+    local flatVel = Vector3.new(vel.X, 0, vel.Z)
+    local serverPos = ownerRoot.Position + flatVel * ping
+    local myPos2D  = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
+    local target2D = Vector3.new(serverPos.X, 0, serverPos.Z)
+    local interceptT = CalcInterceptTime(myPos2D, target2D, flatVel, AutoTackleConfig.TackleSpeed)
+    Gui.PredictionLabel.Text = string.format(
+        "Pred: p=%.0f t=%.0f v=%.1f",
+        ping * 1000,
+        interceptT * 1000,
+        flatVel.Magnitude
+    )
 end
 
 -- === ПИНГ ===
@@ -841,6 +850,12 @@ AutoTackle.Start = function()
                 Gui.TackleDribblingLabel.Text = "isDribbling: " .. tostring(owner and DribbleStates[owner] and DribbleStates[owner].IsDribbling or false)
                 Gui.TackleTacklingLabel.Text  = "isTackling: " .. tostring(owner and IsSpecificTackle(owner) or false)
                 Gui.PingLabel.Text = string.format("Ping: %dms", math.round(AutoTackleStatus.Ping * 1000))
+            end
+
+            -- Обновляем prediction label каждый кадр (не только при такле)
+            if owner then
+                local ownerRootLive = owner.Character and owner.Character:FindFirstChild("HumanoidRootPart")
+                UpdatePredictionLabel(ownerRootLive, owner)
             end
 
             -- Instant Tackle Distance
