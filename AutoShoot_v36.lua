@@ -43,7 +43,11 @@ local AutoShootSpoofPowerType    = "math.huge"
 local GRAVITY              = 196.2   -- studs/s² (Roblox workspace gravity)
 local AutoShootBallSpeed   = 380     -- Скорость мяча studs/s. Мяч выше цели → увеличь. Мяч ниже → уменьши.
 local AutoShootDragComp    = 0.10    -- Компенсация трения (studs / stud дистанции × 0.01). Мяч не долетает → увеличь.
-local FIXED_POWER          = 5.0    -- Power отправляемый на сервер (не влияет на траекторию, константа)
+local FIXED_POWER          = 5.0
+local GK_REACH_RADIUS      = 5.0    -- Радиус статичного покрытия GK (studs)
+local GK_REACH_SPEED       = 12.0   -- Скорость реакции GK для предикта дайва (studs/s)
+local SPIN_TRICK_DIST      = 72     -- Ниже этой дистанции спин/навесы не работают на сервере
+local SPIN_TRICK_MULT      = 2.8    -- ShootVel множитель для обмана дистанции
 local BALL_RADIUS           = 1.168  -- радиус мяча: 2.336 / 2 studs
 -- Безопасный отступ = радиус мяча + небольшой запас чтобы мяч не касался штанги
 local INSET                = BALL_RADIUS + 0.35  -- ~1.52 studs
@@ -282,6 +286,8 @@ end
 -- Возвращает: hrp, localX (отступ от центра), localY (высота от пола ворот),
 --             gkWidth (ширина тела ≈ 4 stud), isAggressive
 -- ============================================================
+local GkTrack = {}  -- { [name] = {pos=, time=, vel=} }
+
 local function GetEnemyGoalie()
     if not GoalCFrame or not GoalWidth then
         if Gui then Gui.GK.Text = "GK: No Goal" end
@@ -349,7 +355,26 @@ local function GetEnemyGoalie()
             best.localX, best.localY)
         Gui.GK.Color = Color3.fromRGB(255, 200, 0)
     end
-    return best.hrp, best.localX, best.localY, isAggressive
+    -- Velocity tracking
+    local now = tick()
+    local tr  = GkTrack[best.name]
+    local vel = Vector3.zero
+    if tr and (now - tr.time) > 0.02 and (now - tr.time) < 0.8 then
+        vel = (best.hrp.Position - tr.pos) / (now - tr.time)
+    end
+    GkTrack[best.name] = { pos = best.hrp.Position, time = now, vel = vel }
+
+    -- localY: высота от реального пола ворот
+    best.localY = best.hrp.Position.Y - (GoalFloorY or GoalCFrame.Position.Y)
+
+    local isAggressive = not best.isInGoal
+    if Gui then
+        Gui.GK.Text = string.format("GK: %s%s X=%.1f Y=%.1f v=%.1f",
+            best.name, isAggressive and " [RUSH]" or "",
+            best.localX, best.localY, vel.Magnitude)
+        Gui.GK.Color = isAggressive and Color3.fromRGB(255,80,0) or Color3.fromRGB(255,200,0)
+    end
+    return best.hrp, best.localX, best.localY, isAggressive, vel
 end
 
 -- ============================================================
@@ -370,6 +395,8 @@ local CurrentFlightTime = 0
 local CurrentLaunchDir  = nil
 local CurrentSpeed      = 0
 local CurrentPeakPos    = nil
+local CurrentIsLob      = false
+local CurrentDist       = 0
 local LastShoot = 0
 local CanShoot  = true
 
@@ -402,6 +429,9 @@ local function CalcLaunchDir(startPos, targetPos)
     -- Поправка трения: линейно растёт с дистанцией
     -- AutoShootDragComp — studs дополнительной высоты на каждые 10 studs дистанции
     local dragComp = AutoShootDragComp * horizDist * 0.1
+    if horizDist > 80 then
+        dragComp = dragComp + AutoShootDragComp * ((horizDist - 80) / 80)^2 * 4.0
+    end
 
     -- Поднимаем целевую точку на обе поправки
     local corrY = targetPos.Y + gravComp + dragComp
@@ -417,18 +447,27 @@ local function CalcLaunchDir(startPos, targetPos)
     return dir, horizDist, realT
 end
 
-local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
+local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
     if not GoalCFrame or not GoalWidth or not GoalHeight then return nil end
     if dist > AutoShootMaxDistance then return nil end
 
-    local startPos = GetBallStartPos()  -- реальная позиция мяча, не HRP!
-    local halfW    = GoalWidth / 2 - INSET
+    local startPos     = GetBallStartPos()
+    local halfW        = GoalWidth / 2 - INSET
+    local playerLocalX = GoalCFrame:PointToObjectSpace(startPos).X
+    gkVel = gkVel or Vector3.zero
 
-    -- Сетка кандидатов: 7 × 5 = 35 точек
-    -- Включает верхние и нижние углы, пост-хаг зоны
+    -- Предикт позиции GK через approxT секунд
+    local approxT    = dist / AutoShootBallSpeed
+    local gkPredW    = gkHrp and (gkHrp.Position + gkVel * math.min(approxT, 0.8)) or nil
+    local gkPredLoc  = gkPredW and GoalCFrame:PointToObjectSpace(gkPredW) or nil
+    local pgkX       = gkPredLoc and gkPredLoc.X or gkX
+    local pgkY       = gkPredLoc and (gkPredW.Y - (GoalFloorY or GoalCFrame.Position.Y)) or gkY
+    -- Зона дайва GK: статичный радиус + то что успеет пробежать за time
+    local diveRange  = GK_REACH_RADIUS + GK_REACH_SPEED * approxT
+
     local xPoints = {-halfW, -halfW*0.7, -halfW*0.35, 0, halfW*0.35, halfW*0.7, halfW}
-    -- yFracs: 10%=низкий, 30%=нижний угол, 55%=середина, 78%=верхний угол, 93%=самый верх
-    local yFracs  = {0.10, 0.30, 0.55, 0.78, 0.93}
+    -- Добавлены навесные фракции 0.88 и 0.96
+    local yFracs  = {0.10, 0.30, 0.55, 0.78, 0.88, 0.96}
 
     local candidates = {}
 
@@ -440,39 +479,51 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
             -- 3D позиция цели (idealPos) — точка в плоскости ворот
             local idealPos = GoalCFrame * Vector3.new(localX, localY, 0)
 
-            -- === SCORING ===
-            -- 1. Ключевой критерий: 2D расстояние от GK до точки в плоскости ворот
-            local gkDistX  = math.abs(gkX - localX)
-            local gkDistY  = math.abs(gkY - localY)
-            local gkDist2D = math.sqrt(gkDistX*gkDistX + gkDistY*gkDistY)
-            local score    = gkDist2D * 2.5  -- основной вес
+            -- === SCORING (предикт где GK будет когда мяч прилетит) ===
+            local gkDistX   = math.abs(gkX - localX)
+            local gkDistY   = math.abs(gkY - localY)
+            local gkDist2D  = math.sqrt(gkDistX*gkDistX + gkDistY*gkDistY)
+            local pgkDistX  = math.abs(pgkX - localX)
+            local pgkDistY  = math.abs(pgkY - localY)
+            local pgkDist2D = math.sqrt(pgkDistX*pgkDistX + pgkDistY*pgkDistY)
 
-            -- 2. Бонус верхние углы: труднее всего для GK (нужен прыжок + смещение)
-            local isTopCorner = (localY > GoalHeight * 0.70) and (math.abs(localX) > halfW * 0.55)
-            local isCorner    = math.abs(localX) > halfW * 0.55
-            local isTop       = localY > GoalHeight * 0.70
-            if isTopCorner then score = score + 6.0 end  -- топ-угол — самый ценный
-            if isCorner    then score = score + 2.5 end  -- любой угол
-            if isTop and not isTopCorner then score = score + 1.5 end  -- верх по центру
+            -- Основа: расстояние предиктной позиции GK от точки
+            -- Штраф если в зоне дайва: GK достанет
+            local reachability = math.clamp(1 - pgkDist2D / diveRange, 0, 1)
+            local score = pgkDist2D * 2.8 - reachability * 9.0
 
-            -- 3. Штраф за центр (GK стартует по центру)
-            if math.abs(localX) < halfW * 0.15 then score = score - 3.0 end
+            local isTopCorner = (localY > GoalHeight * 0.72) and (math.abs(localX) > halfW * 0.5)
+            local isCorner    = math.abs(localX) > halfW * 0.5
+            local isLobShot   = (yf >= 0.85)
 
-            -- 4. GK высоко → низкий мяч выгоднее
-            if gkY > GoalHeight * 0.55 and localY < GoalHeight * 0.25 then score = score + 5.0 end
+            -- Верхние углы: прыжок + смещение = труднее всего
+            if isTopCorner then score = score + 7.0 end
+            if isCorner and not isTopCorner then score = score + 2.5 end
 
-            -- 5. "Дальний угол" бонус: угол противоположный от игрока
-            local playerLocalX = GoalCFrame:PointToObjectSpace(startPos).X
-            local isFarCorner  = (playerLocalX > 0 and localX < -halfW*0.4)
-                               or (playerLocalX < 0 and localX >  halfW*0.4)
-            if isFarCorner then score = score + 3.0 end
+            -- Навес: ценен когда GK низко или выходит вперёд
+            if isLobShot then
+                if pgkY < GoalHeight * 0.55 then score = score + 5.0 end
+                if isAggressive             then score = score + 7.0 end
+            end
 
-            -- 6. GK rush — штраф если он прямо на пути, бонус если уходим
+            -- Центр: штраф
+            if math.abs(localX) < halfW * 0.15 then score = score - 3.5 end
+
+            -- Дальний угол (противоположный стороне игрока)
+            local isFarCorner = (playerLocalX > halfW*0.2 and localX < -halfW*0.4)
+                             or (playerLocalX < -halfW*0.2 and localX >  halfW*0.4)
+            if isFarCorner then score = score + 3.5 end
+
+            -- GK rush: прямо на пути = плохо, сбоку = хорошо
             if isAggressive and gkHrp then
-                local shootVec = (idealPos - startPos).Unit
-                local gkVec    = (gkHrp.Position - startPos).Unit
-                local dot = shootVec:Dot(gkVec)
-                score = score + (dot > 0.92 and -10.0 or 6.0)
+                local dot = (idealPos - startPos).Unit:Dot((gkHrp.Position - startPos).Unit)
+                score = score + (dot > 0.90 and -12.0 or 7.0)
+            end
+
+            -- GK движется к точке: штраф
+            if gkVel.Magnitude > 2 and gkHrp then
+                local toT = (idealPos - gkHrp.Position).Unit
+                if gkVel.Unit:Dot(toT) > 0.65 then score = score - 4.5 end
             end
 
             -- Power не влияет на траекторию → константа
@@ -540,21 +591,22 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
                 launchDir.Z * speed * tPeak
             )
             table.insert(candidates, {
-                idealPos   = idealPos,
-                aimPoint   = aimPoint,
-                shootPos   = shootPos,
-                launchDir  = launchDir,
-                localX     = localX,
-                localY     = localY,
-                spin       = spinDir,
-                power      = power,
-                speed      = speed,
-                score      = score,
-                gkDist     = gkDist2D,
-                trajOk     = trajOk,
-                flightTime = flightTime,
-                peakPos    = peakPos,
+                idealPos    = idealPos,
+                aimPoint    = aimPoint,
+                shootPos    = shootPos,
+                launchDir   = launchDir,
+                localX      = localX,
+                localY      = localY,
+                spin        = spinDir,
+                power       = power,
+                speed       = speed,
+                score       = score,
+                gkDist      = gkDist2D,
+                trajOk      = trajOk,
+                flightTime  = flightTime,
+                peakPos     = peakPos,
                 isTopCorner = isTopCorner,
+                isLobShot   = isLobShot,
             })
         end
     end
@@ -581,9 +633,14 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
             local normalLocal = Vector3.new(pd.side, 0, 0)
             local nWorld      = GoalCFrame:VectorToWorldSpace(normalLocal)
 
+            -- Открытость угла рикошета
+            -- Если игрок с той же стороны что и штанга — угол закрыт (летим почти параллельно)
+            -- pd.postLocalX < 0 = левая штанга; playerLocalX < -halfW*0.25 = игрок слева
+            local isClosedAngle = (pd.postLocalX < 0 and playerLocalX < -halfW * 0.20)
+                                or (pd.postLocalX > 0 and playerLocalX >  halfW * 0.20)
+
             for _, hf in ipairs({0.20, 0.45, 0.72}) do
                 local hitY      = hf * GoalHeight
-                -- Центр мяча в момент касания: на BALL_RADIUS кнутри от внутренней грани штанги
                 local hitLocalX = pd.postLocalX + pd.side * BALL_RADIUS
                 local hitWorld  = GoalCFrame * Vector3.new(hitLocalX, hitY, 0)
 
@@ -596,12 +653,14 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
                 local dotVal = dInFlat:Dot(nWorld)
                 local dOut   = (dInFlat - 2 * dotVal * nWorld).Unit
 
-                -- Проверяем что dOut смотрит в сторону ворот (по глубине)
-                -- GoalCFrame.LookVector = направление "в ворота" от поля
+                -- Угол падения на штангу (cosIncidence = |d_in · n|)
+                local cosInc = math.abs(dotVal)
+                local incDeg = math.deg(math.acos(math.clamp(cosInc, 0, 1)))
+                -- Хороший рикошет: 20°-72° (слишком мелкий = скользящий, слишком большой = назад)
+                local badAngle = isClosedAngle or (incDeg < 18) or (incDeg > 74)
+
                 local dOutLocalZ = GoalCFrame:VectorToObjectSpace(dOut).Z
-                -- В нашей CFrame Z+ = к полю, Z- = в глубину ворот
-                -- Нам нужно dOut.Z < 0 (в глубину ворот) ИЛИ вдоль ворот — принимаем оба
-                local goesIn = (dOutLocalZ < 0.1)
+                local goesIn = (dOutLocalZ < 0.1) and not badAngle
 
                 if goesIn then
                     -- Примерная точка приземления: двигаемся вглубь ворот на 5 studs
@@ -696,8 +755,8 @@ local function CalculateTarget()
         return
     end
 
-    local gkHrp, gkX, gkY, isAggressive = GetEnemyGoalie()
-    local result = GetTarget(dist, gkX or 0, gkY or 0, isAggressive or false, gkHrp)
+    local gkHrp, gkX, gkY, isAggressive, gkVel = GetEnemyGoalie()
+    local result = GetTarget(dist, gkX or 0, gkY or 0, isAggressive or false, gkHrp, gkVel)
     if not result then
         TargetPoint = nil; LastShootRedBox = nil
         if Gui then Gui.Target.Text = "No Candidate" end
@@ -705,12 +764,15 @@ local function CalculateTarget()
     end
 
     ShootDir       = result.launchDir
-    -- ShootVel: сохраняем старую магнитуду (FIXED_POWER * 1400) чтобы сервер принял
-    -- direction — новая (с поправкой на гравитацию), magnitude — как в оригинале
-    ShootVel       = ShootDir * (FIXED_POWER * 1400)
+    -- TRICK: ниже SPIN_TRICK_DIST сервер не применяет спин/навесы.
+    -- Умножаем ShootVel → сервер "видит" большую дистанцию и применяет нужный эффект.
+    local needsTrick = CurrentDist < SPIN_TRICK_DIST and (CurrentSpin ~= "None" or CurrentIsLob)
+    ShootVel = ShootDir * (FIXED_POWER * 1400 * (needsTrick and SPIN_TRICK_MULT or 1.0))
     CurrentSpin    = result.spin
     CurrentPower   = FIXED_POWER  -- power константа, не влияет на траекторию
-    local typePrefix = result.isRicochet and "[RIC] " or (result.isTopCorner and "[TC] " or "")
+    local typePrefix = result.isRicochet and "[RIC] "
+        or (result.isLobShot and "[LOB] "
+        or (result.isTopCorner and "[TC] " or ""))
     CurrentType    = string.format("%sX=%.1f Y=%.1f/%.1f gk=%.1f",
                         typePrefix, result.localX, result.localY, GoalHeight, result.gkDist)
 
@@ -724,6 +786,8 @@ local function CalculateTarget()
     CurrentLaunchDir  = result.launchDir
     CurrentSpeed      = result.speed
     CurrentPeakPos    = result.peakPos
+    CurrentIsLob      = result.isLobShot or false
+    CurrentDist       = dist
     TargetPoint       = result.shootPos
 
     if Gui then
