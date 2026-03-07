@@ -51,7 +51,11 @@ local SPIN_TRICK_MULT      = 2.8    -- ShootVel множитель для обм
 local AutoShootDerivMult   = 4.5    -- studs деривации при d=100. Мяч улетает меньше → увеличь.
 local BALL_RADIUS           = 1.168  -- радиус мяча: 2.336 / 2 studs
 -- Безопасный отступ = радиус мяча + небольшой запас чтобы мяч не касался штанги
-local INSET                = BALL_RADIUS + 0.35  -- ~1.52 studs
+local INSET                = BALL_RADIUS + 0.35  -- ~1.52 studs (горизонтальный, от штанг)
+-- Вертикальный инсет: центр мяча должен быть минимум BALL_RADIUS от перекладины/пола
+-- Дополнительный запас 0.25 studs покрывает неточность физической модели
+local Y_TOP_INSET          = BALL_RADIUS + 0.25   -- 1.42 studs от перекладины
+local Y_BOT_INSET          = 0.30                 -- 0.30 studs от пола
 
 -- ============================================================
 -- STATUS
@@ -489,7 +493,10 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
     for _, xf in ipairs(xPoints) do
         for _, yf in ipairs(yFracs) do
             local localX = xf
-            local localY = yf * GoalHeight  -- высота над полом ворот (studs), РЕАЛЬНАЯ
+            -- Цель с учётом вертикального инсета: центр мяча никогда не доходит
+            -- до перекладины или пола ближе чем на радиус мяча + запас точности.
+            local yRange = math.max(0.5, GoalHeight - Y_TOP_INSET - Y_BOT_INSET)
+            local localY = Y_BOT_INSET + yf * yRange  -- гарантированно внутри ворот
 
             -- 3D позиция цели (idealPos) — точка в плоскости ворот
             local idealPos = GoalCFrame * Vector3.new(localX, localY, 0)
@@ -622,14 +629,17 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
                 aimPoint = shootPos
             end
 
-            -- ШТРАФ если прицел (aimPoint) уходит выше перекладины ворот.
-            -- На ближних дистанциях гравитационная поправка поднимает прицел,
-            -- и верхние цели становятся физически недостижимы без перелёта.
-            local crossbarWorldY = GoalFloorY + GoalHeight
-            if aimPoint.Y > crossbarWorldY + 0.1 then
-                -- Пропорциональный штраф: чем выше прицел над перекладиной, тем хуже
-                local over = aimPoint.Y - crossbarWorldY
-                score = score - over * 7.0
+            -- ШТРАФ за прицел выше безопасной зоны (gravComp поднимает aim выше цели).
+            -- aimPoint.Y ≈ targetPos.Y (куда мяч ПРИЛЕТИТ), а не куда мы ЦЕЛИМСЯ.
+            -- Прицел = localY + gravComp. Безопасный максимум = GoalHeight - Y_TOP_INSET.
+            local gravCompHere = 0.5 * GRAVITY * flightT * flightT
+            local aimLocalY    = localY + gravCompHere   -- высота прицела внутри ворот
+            local safeTop      = GoalHeight - Y_TOP_INSET
+            if aimLocalY > safeTop then
+                local over = aimLocalY - safeTop
+                -- Штраф растёт квадратично: маленький перелёт — небольшой штраф,
+                -- большой перелёт (близкая дистанция + высокая цель) — очень большой
+                score = score - over * over * 6.0 - over * 4.0
             end
 
             -- flightTime уже рассчитан CalcLaunchDir
