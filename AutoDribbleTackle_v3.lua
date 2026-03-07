@@ -1,4 +1,5 @@
 -- [v3.1] AUTO DRIBBLE + AUTO TACKLE
+print('6')
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -26,243 +27,6 @@ for _, anim in pairs(DribbleAnims:GetChildren()) do
     end
 end
 
--- === ПИНГ ===
-local function GetPing()
-    local success, pingValue = pcall(function()
-        local pingStat = Stats.Network.ServerStatsItem["Data Ping"]
-        local pingStr = pingStat:GetValueString()
-        local ping = tonumber(pingStr:match("%d+"))
-        return ping or 0
-    end)
-    -- pingValue=0 тоже truthy в Lua, но 0ms пинг нереален — используем fallback
-    if success and pingValue and pingValue > 0 then return pingValue / 1000 end
-    return 0.1
-end
-
--- === CONFIG ===
-local AutoTackleConfig = {
-    Enabled = false,
-    Mode = "OnlyDribble", -- "OnlyDribble", "EagleEye", "ManualTackle"
-    MaxDistance = 20,
-    TackleDistance = 0,
-    TackleSpeed = 47,
-    OnlyPlayer = true,
-    RotationMethod = "Snap", -- "Snap", "Always", "None"
-    DribbleDelayTime = 0.63,
-    EagleEyeMinDelay = 0.1,
-    EagleEyeMaxDelay = 0.6,
-    ManualTackleEnabled = true,
-    ManualTackleKeybind = Enum.KeyCode.Q,
-    ManualTackleCooldown = 0.5,
-    ManualButton = false,
-    ButtonScale = 1.0,
-}
-
-local AutoDribbleConfig = {
-    Enabled = false,
-    MaxDribbleDistance = 30,
-    DribbleActivationDistance = 16,
-    MinAngleForDribble = 30,      -- Минимальный угол атаки такля в нас (чем меньше — строже)
-    HeadOnAngleThreshold = 45,    -- Угол для "head-on" детекции
-}
-
-local DebugConfig = {
-    Enabled = true,
-    MoveEnabled = false,
-    Position = Vector2.new(0.5, 0.5)
-}
-
--- === STATES ===
-local AutoTackleStatus = {
-    Running = false,
-    Connection = nil,
-    HeartbeatConnection = nil,
-    InputConnection = nil,
-    ButtonGui = nil,
-    TouchStartTime = 0,
-    Dragging = false,
-    DragStart = Vector2.new(0, 0),
-    StartPos = UDim2.new(0, 0, 0, 0),
-    Ping = 0.1,
-    LastPingUpdate = 0,
-    -- История позиций для Position-Based предикта
-    TargetPositionHistory = {}, -- [player] = { {time, pos}, ... }
-    TargetCircles = {}
-}
-
-local AutoDribbleStatus = {
-    Running = false,
-    Connection = nil,
-    HeartbeatConnection = nil,
-    LastDribbleTime = 0,
-    TackleDetectionCooldown = 0
-}
-
--- === SHARED STATES ===
-local DribbleStates = {}
-local TackleStates = {}
-local PrecomputedPlayers = {}
-local HasBall = false
-local CanDribbleNow = false
--- DribbleCooldownList[player] = expireTime — игрок использовал дриббл, задержка прошла, готовы к таклу
-local DribbleCooldownList = {}
-local EagleEyeTimers = {}
-local IsTypingInChat = false
-local LastManualTackleTime = 0
-local CurrentTargetOwner = nil
-
-local SPECIFIC_TACKLE_ID = "rbxassetid://14317040670"
-
--- ============================================================
--- === ПРЕДИКТ ПОЗИЦИИ (Position-Based, не velocity-based) ===
--- ============================================================
--- Идея: вместо AssemblyLinearVelocity считаем реальное смещение
--- позиции между кадрами за историю N последних точек.
--- Это устойчиво к "обманкам" (резкая остановка, fake-outs),
--- потому что резкое изменение velocity не успеет попасть в
--- сглаженный тренд позиции.
--- =============================================================
--- === ПРЕДИКТ ПОЗИЦИИ (Intercept-based)
--- Принцип: мы не просто берём velocity * leadTime.
--- Мы решаем задачу перехвата: куда нужно направить такл,
--- чтобы он ВСТРЕТИЛСЯ с врагом, учитывая:
---   1. Скорость врага (position-based, устойчива к fake-outs)
---   2. Скорость такла (TackleSpeed studs/sec)
---   3. Дистанцию до врага
---   4. Пинг — позиция врага у нас «устаревшая» на ping секунд,
---      поэтому сначала экстраполируем её вперёд на ping,
---      и уже от этой «реальной» позиции считаем перехват.
--- =============================================================
-local HISTORY_SIZE   = 8
-local HISTORY_WINDOW = 0.20 -- секунды
-
-local function RecordTargetPosition(ownerRoot, player)
-    local history = AutoTackleStatus.TargetPositionHistory[player]
-    if not history then
-        history = {}
-        AutoTackleStatus.TargetPositionHistory[player] = history
-    end
-    table.insert(history, { time = tick(), pos = ownerRoot.Position })
-    while #history > HISTORY_SIZE do table.remove(history, 1) end
-end
-
--- Возвращает velocity врага в studs/sec, вычисленную по истории позиций.
--- Берём только точки не старше HISTORY_WINDOW — если враг недавно резко
--- затормозил, старые точки выпадут из окна и скорость обнулится.
-local function GetPositionBasedVelocity(player)
-    local history = AutoTackleStatus.TargetPositionHistory[player]
-    if not history or #history < 2 then return Vector3.zero end
-    local now = tick()
-    local recent = {}
-    for _, pt in ipairs(history) do
-        if now - pt.time <= HISTORY_WINDOW then table.insert(recent, pt) end
-    end
-    if #recent < 2 then
-        -- Недостаточно свежих точек — возвращаем нуль (безопаснее чем stale данные)
-        return Vector3.zero
-    end
-    local oldest = recent[1]; local newest = recent[#recent]
-    local dt = newest.time - oldest.time
-    if dt < 0.001 then return Vector3.zero end
-    return (newest.pos - oldest.pos) / dt
-end
-
--- Вызывается каждый Heartbeat — накапливает историю позиций владельца мяча.
--- Без этого RecordTargetPosition вызывался только в момент такла,
--- и история всегда была пустой → velocity = 0 → Pred = 0ms.
-local function UpdateBallOwnerHistory()
-    local ball = Workspace:FindFirstChild("ball")
-    if not ball then return end
-    local creatorRef = ball:FindFirstChild("creator")
-    if not creatorRef or not creatorRef.Value then return end
-    local owner = creatorRef.Value
-    if owner == LocalPlayer then return end
-    if not owner.Character then return end
-    local ownerRoot = owner.Character:FindFirstChild("HumanoidRootPart")
-    if not ownerRoot then return end
-    RecordTargetPosition(ownerRoot, owner)
-end
-
-local function PredictTargetPosition(ownerRoot, player)
-    if not ownerRoot then return ownerRoot.Position end
-    RecordTargetPosition(ownerRoot, player)
-
-    local ping = AutoTackleStatus.Ping
-    local tackleSpeed = AutoTackleConfig.TackleSpeed
-
-    -- Шаг 1: «реальная» серверная позиция врага.
-    -- У нас позиция с задержкой пинга, значит враг уже ушёл вперёд.
-    local vel = GetPositionBasedVelocity(player)
-    local flatVel = Vector3.new(vel.X, 0, vel.Z)
-
-    -- Компенсируем пинг: экстраполируем позицию вперёд на ping секунд
-    local serverPos = ownerRoot.Position + flatVel * ping
-
-    -- Шаг 2: Решаем задачу перехвата (intercept time).
-    -- Уравнение: |myPos - (serverPos + flatVel * t)| = tackleSpeed * t
-    -- Это квадратное уравнение: (tackleSpeed²-v²)t² + 2*(serverPos-myPos)·v*t - dist² = 0
-    local myPos = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
-    local targetPos2D = Vector3.new(serverPos.X, 0, serverPos.Z)
-    local toTarget = targetPos2D - myPos
-    local dist = toTarget.Magnitude
-
-    local interceptTime
-
-    local v2 = flatVel:Dot(flatVel)                   -- |v|²
-    local ts2 = tackleSpeed * tackleSpeed              -- tackleSpeed²
-    local dot_d_v = toTarget:Dot(flatVel)              -- (serverPos - myPos) · v
-
-    local a = ts2 - v2
-    local b = -2 * dot_d_v
-    local c = -(dist * dist)
-
-    if math.abs(a) < 0.001 then
-        -- Скорости равны — линейное решение
-        if math.abs(b) > 0.001 then
-            interceptTime = -c / b
-        else
-            interceptTime = 0
-        end
-    else
-        local discriminant = b * b - 4 * a * c
-        if discriminant < 0 then
-            -- Нет решения (не догнать) — используем простой fallback
-            interceptTime = dist / math.max(tackleSpeed, 1)
-        else
-            local sqrtD = math.sqrt(discriminant)
-            local t1 = (-b - sqrtD) / (2 * a)
-            local t2 = (-b + sqrtD) / (2 * a)
-            -- Берём наименьшее положительное
-            if t1 > 0 and t2 > 0 then
-                interceptTime = math.min(t1, t2)
-            elseif t1 > 0 then
-                interceptTime = t1
-            elseif t2 > 0 then
-                interceptTime = t2
-            else
-                interceptTime = dist / math.max(tackleSpeed, 1)
-            end
-        end
-    end
-
-    -- Ограничиваем максимальное время перехвата (защита от ухода в бесконечность)
-    interceptTime = math.clamp(interceptTime, 0.03, 0.4)
-
-    local predictedPos = serverPos + flatVel * interceptTime
-
-    if Gui and AutoTackleConfig.Enabled then
-        Gui.PredictionLabel.Text = string.format(
-            "Pred: %.0fms | ping: %.0fms | v=%.1f",
-            interceptTime * 1000,
-            ping * 1000,
-            flatVel.Magnitude
-        )
-    end
-
-    return predictedPos
-end
-
--- === ПИНГ ===
 -- === ПИНГ ===
 local function GetPing()
     local success, pingValue = pcall(function()
@@ -350,15 +114,20 @@ local CurrentTargetOwner = nil
 local SPECIFIC_TACKLE_ID = "rbxassetid://14317040670"
 
 -- ============================================================
--- === ПРЕДИКТ ПОЗИЦИИ (Position-Based, не velocity-based) ===
+-- === ПРЕДИКТ ПОЗИЦИИ — Intercept-based
+-- Алгоритм:
+-- 1) История позиций врага (position-based velocity, устойчива
+--    к fake-outs — резкая остановка отражается за ~0.1с)
+-- 2) Компенсация пинга: позиция у нас "устаревшая" на ping сек,
+--    значит враг УЖЕ ушёл вперёд → прибавляем vel*ping
+-- 3) Решаем задачу перехвата (intercept):
+--    |myPos - (serverPos + vel*t)| = TackleSpeed * t
+--    Квадратное уравнение → берём минимальное t > 0
+-- ВАЖНО: RecordTargetPosition вызывается каждый кадр из
+-- PrecomputePlayers, а не только при такле!
 -- ============================================================
--- Идея: вместо AssemblyLinearVelocity считаем реальное смещение
--- позиции между кадрами за историю N последних точек.
--- Это устойчиво к "обманкам" (резкая остановка, fake-outs),
--- потому что резкое изменение velocity не успеет попасть в
--- сглаженный тренд позиции.
-local HISTORY_SIZE = 6      -- кол-во точек истории
-local HISTORY_WINDOW = 0.15 -- в секундах, берём только точки не старше этого
+local HISTORY_SIZE   = 8
+local HISTORY_WINDOW = 0.1 -- секунды; короткое окно = быстрая реакция на торможение
 
 local function RecordTargetPosition(ownerRoot, player)
     local history = AutoTackleStatus.TargetPositionHistory[player]
@@ -366,58 +135,100 @@ local function RecordTargetPosition(ownerRoot, player)
         history = {}
         AutoTackleStatus.TargetPositionHistory[player] = history
     end
-    local now = tick()
-    table.insert(history, { time = now, pos = ownerRoot.Position })
-    -- Держим не больше HISTORY_SIZE точек
-    while #history > HISTORY_SIZE do
-        table.remove(history, 1)
-    end
+    table.insert(history, { time = tick(), pos = ownerRoot.Position })
+    while #history > HISTORY_SIZE do table.remove(history, 1) end
 end
 
 local function GetPositionBasedVelocity(player)
-    -- Возвращает усреднённую скорость по истории позиций (studs/sec)
     local history = AutoTackleStatus.TargetPositionHistory[player]
     if not history or #history < 2 then return Vector3.zero end
     local now = tick()
-    -- Берём только точки в пределах HISTORY_WINDOW
-    local recent = {}
+    -- Берём только свежие точки в пределах HISTORY_WINDOW
+    local oldest, newest = nil, nil
     for _, pt in ipairs(history) do
         if now - pt.time <= HISTORY_WINDOW then
-            table.insert(recent, pt)
+            if not oldest then oldest = pt end
+            newest = pt
         end
     end
-    if #recent < 2 then
-        -- Fallback: последние 2 точки
-        recent = { history[#history - 1], history[#history] }
+    if not oldest or oldest == newest then
+        -- Fallback на последние 2 точки если свежих мало
+        if #history >= 2 then
+            oldest = history[#history - 1]
+            newest = history[#history]
+        else
+            return Vector3.zero
+        end
     end
-    local oldest = recent[1]
-    local newest = recent[#recent]
     local dt = newest.time - oldest.time
     if dt < 0.001 then return Vector3.zero end
-    local displacement = newest.pos - oldest.pos
-    return displacement / dt
+    return (newest.pos - oldest.pos) / dt
+end
+
+-- Вычисляет время перехвата (intercept time) методом квадратного уравнения.
+-- Возвращает время в секундах за которое объект скоростью speed достигнет
+-- точки targetPos движущейся со скоростью vel, стартуя из fromPos.
+local function CalcInterceptTime(fromPos, targetPos, vel, speed)
+    local toTarget = targetPos - fromPos
+    local dist = toTarget.Magnitude
+    if dist < 0.01 then return 0 end
+    local v2   = vel:Dot(vel)
+    local ts2  = speed * speed
+    local dotDV = toTarget:Dot(vel)
+    local a = ts2 - v2
+    local b = -2 * dotDV
+    local c = -(dist * dist)
+    local t
+    if math.abs(a) < 0.001 then
+        -- Скорость такла = скорость цели: линейное решение
+        t = (math.abs(b) > 0.001) and (-c / b) or (dist / math.max(speed, 1))
+    else
+        local disc = b * b - 4 * a * c
+        if disc < 0 then
+            t = dist / math.max(speed, 1) -- не догнать — летим напрямую
+        else
+            local sqrtD = math.sqrt(disc)
+            local t1 = (-b - sqrtD) / (2 * a)
+            local t2 = (-b + sqrtD) / (2 * a)
+            if t1 > 0 and t2 > 0 then t = math.min(t1, t2)
+            elseif t1 > 0 then t = t1
+            elseif t2 > 0 then t = t2
+            else t = dist / math.max(speed, 1) end
+        end
+    end
+    return math.clamp(t, 0.02, 0.5)
 end
 
 local function PredictTargetPosition(ownerRoot, player)
     if not ownerRoot then return ownerRoot.Position end
-    RecordTargetPosition(ownerRoot, player)
+    -- НЕ записываем здесь — записываем в PrecomputePlayers каждый кадр
 
-    local ping = AutoTackleStatus.Ping
-    -- Небольшой дополнительный лид, чтобы такл прилетал "наперёд"
-    local leadTime = math.clamp(ping + 0.06, 0.04, 0.22)
+    local ping  = AutoTackleStatus.Ping
+    local vel   = GetPositionBasedVelocity(player)
+    local flatVel = Vector3.new(vel.X, 0, vel.Z)
 
-    -- Используем position-based velocity вместо AssemblyLinearVelocity
-    local posVelocity = GetPositionBasedVelocity(player)
+    -- Шаг 1: компенсация пинга — враг уже ушёл вперёд на ping секунд
+    local serverPos = ownerRoot.Position + flatVel * ping
 
-    -- Убираем вертикаль
-    local flatVel = Vector3.new(posVelocity.X, 0, posVelocity.Z)
+    -- Шаг 2: intercept — куда лететь чтобы встретиться
+    local myPos2D   = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
+    local target2D  = Vector3.new(serverPos.X, 0, serverPos.Z)
+    local flatVel2D = Vector3.new(flatVel.X, 0, flatVel.Z)
 
-    local predictedPos = ownerRoot.Position + flatVel * leadTime
+    local interceptT = CalcInterceptTime(myPos2D, target2D, flatVel2D, AutoTackleConfig.TackleSpeed)
+
+    -- Предсказанная точка перехвата (Y берём от serverPos)
+    local predictedPos = Vector3.new(
+        serverPos.X + flatVel.X * interceptT,
+        serverPos.Y,
+        serverPos.Z + flatVel.Z * interceptT
+    )
 
     if Gui and AutoTackleConfig.Enabled then
         Gui.PredictionLabel.Text = string.format(
-            "Pred: %dms | v=%.1f",
-            math.round(leadTime * 1000),
+            "Pred: ping=%.0fms t=%.0fms v=%.1f",
+            ping * 1000,
+            interceptT * 1000,
             flatVel.Magnitude
         )
     end
@@ -856,6 +667,8 @@ local function PrecomputePlayers()
             RootPart   = targetRoot,
             Velocity   = targetRoot.AssemblyLinearVelocity
         }
+        -- Записываем позицию КАЖДЫЙ КАДР чтобы история была свежей к моменту такла
+        RecordTargetPosition(targetRoot, player)
     end
 end
 
@@ -991,7 +804,6 @@ AutoTackle.Start = function()
 
     AutoTackleStatus.HeartbeatConnection = RunService.Heartbeat:Connect(function()
         pcall(UpdatePing)
-        pcall(UpdateBallOwnerHistory)
         pcall(UpdateDribbleStates)
         pcall(PrecomputePlayers)
         pcall(UpdateTargetCircles)
@@ -1181,41 +993,30 @@ end
 -- 3. Время до столкновения < порога
 -- Это отсекает ситуации когда враг таклит не в нас или делает fake-tackle
 
-local DribblePositionHistory = {}
+local DribblePositionHistory = {} -- retained for CharacterAdded cleanup
 
-local function RecordDribbleTargetPos(player, rootPart)
-    local history = DribblePositionHistory[player]
-    if not history then history = {}; DribblePositionHistory[player] = history end
-    table.insert(history, { time = tick(), pos = rootPart.Position })
-    while #history > 5 do table.remove(history, 1) end
-end
-
--- Для AutoDribble используем AssemblyLinearVelocity — нам важна
--- БЫСТРАЯ реакция, а не устойчивость к fake-outs (у нас мяч, нам надо успеть)
 local function ShouldDribbleNow(specificTarget, tacklerData)
     if not specificTarget or not tacklerData then return false end
     local currentTime = tick()
+    -- Антиспам
     if currentTime - AutoDribbleStatus.TackleDetectionCooldown < 0.35 then return false end
 
     local tacklerRoot = tacklerData.RootPart
     if not tacklerRoot then return false end
 
-    -- Записываем для дебага
-    RecordDribbleTargetPos(specificTarget, tacklerRoot)
-
-    local myPos = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
+    local myPos     = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
     local tacklerPos = Vector3.new(tacklerRoot.Position.X, 0, tacklerRoot.Position.Z)
-    local toMe = myPos - tacklerPos
-    local distFlat = toMe.Magnitude
+    local toMe      = myPos - tacklerPos
+    local distFlat  = toMe.Magnitude
 
     if distFlat < 0.1 or distFlat > AutoDribbleConfig.MaxDribbleDistance then return false end
 
-    -- Используем AssemblyLinearVelocity для быстрой реакции
-    local tacklerVel = tacklerData.Velocity  -- уже сохранено в PrecomputedPlayers
-    local flatTacklerVel = Vector3.new(tacklerVel.X, 0, tacklerVel.Z)
-    local tacklerSpeed = flatTacklerVel.Magnitude
+    -- AssemblyLinearVelocity — быстрая реакция (важнее точности для AutoDribble)
+    local tacklerVel   = tacklerData.Velocity
+    local flatVel      = Vector3.new(tacklerVel.X, 0, tacklerVel.Z)
+    local tacklerSpeed = flatVel.Magnitude
 
-    -- Если враг почти стоит — не реагируем (например fake-tackle стоя)
+    -- Стоящий игрок не таклит в нас
     if tacklerSpeed < 3 then
         if Gui and AutoDribbleConfig.Enabled then
             Gui.AngleLabel.Text = string.format("v=%.1f (idle)", tacklerSpeed)
@@ -1223,31 +1024,27 @@ local function ShouldDribbleNow(specificTarget, tacklerData)
         return false
     end
 
-    local tacklerDir = flatTacklerVel.Unit
-    local dirToMe = toMe.Unit
-
-    -- Угол между движением таклера и направлением к нам
-    local dot = tacklerDir:Dot(dirToMe)
+    local tacklerDir = flatVel.Unit
+    local dirToMe    = toMe.Unit
+    local dot   = tacklerDir:Dot(dirToMe)
     local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
 
     if Gui and AutoDribbleConfig.Enabled then
-        Gui.AngleLabel.Text = string.format("Angle: %.1f° | v=%.1f", angle, tacklerSpeed)
+        Gui.AngleLabel.Text = string.format("Angle: %.1f° v=%.1f", angle, tacklerSpeed)
     end
 
-    -- Таклер смотрит слишком мимо нас
+    -- Враг летит не в нашу сторону — игнорируем
     if angle > AutoDribbleConfig.MinAngleForDribble then return false end
 
     -- Время до столкновения
-    local relSpeed = tacklerSpeed + math.max(HumanoidRootPart.AssemblyLinearVelocity.Magnitude, 1)
+    local relSpeed       = tacklerSpeed + math.max(HumanoidRootPart.AssemblyLinearVelocity.Magnitude, 1)
     local timeToCollision = distFlat / relSpeed
 
-    -- Активируем немедленно если совсем рядом
     if distFlat <= AutoDribbleConfig.DribbleActivationDistance then
         AutoDribbleStatus.TackleDetectionCooldown = currentTime
         return true
     end
 
-    -- Чуть дальше — реагируем если летит быстро
     if timeToCollision < 0.55 then
         AutoDribbleStatus.TackleDetectionCooldown = currentTime
         return true
@@ -1544,7 +1341,6 @@ function AutoDribbleTackleModule.Init(UI, coreParam, notifyFunc)
         DribbleStates = {}; TackleStates = {}; PrecomputedPlayers = {}
         DribbleCooldownList = {}; EagleEyeTimers = {}
         AutoTackleStatus.TargetPositionHistory = {}
-        DribblePositionHistory = {}
         AutoTackleStatus.TargetCircles = {}
         DribblePositionHistory = {}
         CurrentTargetOwner = nil
