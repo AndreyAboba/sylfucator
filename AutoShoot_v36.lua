@@ -41,8 +41,8 @@ local AutoShootSpoofPowerEnabled = false
 local AutoShootSpoofPowerType    = "math.huge"
 -- Физика
 local GRAVITY              = 196.2   -- studs/s² (Roblox workspace gravity)
-local AutoShootBallSpeed   = 600     -- Скорость мяча studs/s. Мяч выше цели → увеличь. Мяч ниже → уменьши.
-local AutoShootDragComp    = 0.5     -- k (1/s): экспоненц. затухание v_h=V·e^(-k·t). Не долетает → увеличь. Летит выше → уменьши.
+local AutoShootBallSpeed   = 400     -- Скорость мяча studs/s. Мяч выше цели → увеличь. Мяч ниже → уменьши.
+local AutoShootDragComp    = 1.0     -- k (1/s): экспоненц. затухание v_h=V·e^(-k·t). Не долетает → увеличь. Летит выше → уменьши.
 local FIXED_POWER          = 5.0
 local GK_REACH_RADIUS      = 5.0    -- Радиус статичного покрытия GK (studs)
 local GK_REACH_SPEED       = 12.0   -- Скорость реакции GK для предикта дайва (studs/s)
@@ -133,32 +133,29 @@ local function InitializeCubes()
     SC(PeakCube,   Color3.fromRGB(255,255,0), 4)   -- 🟡 жёлтый = пик дуги
 end
 
--- DrawTrajectory: рисует параболу полёта с учётом drag.
--- Drag моделируется как затухание горизонтальной скорости: v_h(t) = V*cos(θ)*exp(-k*t)
--- где k = AutoShootDragComp * 0.1.  Вертикальная скорость практически не затухает.
--- Это приближение — достаточно точно для визуализации.
-local function DrawTrajectory(startPos, launchDir, flightTime)
-    local V  = AutoShootBallSpeed
-    local vx0 = launchDir.X * V
-    local vy0 = launchDir.Y * V
-    local vz0 = launchDir.Z * V
-    local k   = AutoShootDragComp        -- 1/s, та же модель что в CalcLaunchDir
-
-    -- Вычисляем позицию в момент t с учётом drag
-    local function BallPos(t)
-        local hFactor = (k > 0.001) and ((1 - math.exp(-k*t)) / k) or t
-        return Vector3.new(
-            startPos.X + vx0 * hFactor,
-            startPos.Y + vy0 * t - 0.5 * GRAVITY * t * t,
-            startPos.Z + vz0 * hFactor
-        )
+-- DrawTrajectory: Quadratic Bezier через 3 опорные точки (start → peak → land).
+-- Этот метод ГАРАНТИРОВАННО рисует ровно от мяча до целевой точки,
+-- полностью избегая ошибок интегрирования физики.
+-- startPos = где мяч сейчас, peakPos = пик дуги, endPos = куда прилетит (красный куб).
+local function DrawTrajectory(startPos, peakPos, endPos)
+    if not peakPos or not endPos then
+        for _, l in ipairs(TrajectoryLines) do l.Visible = false end; return
     end
 
+    -- Параметрический Bezier: B(t) = (1-t)²·P0 + 2t(1-t)·Pc + t²·P2
+    -- Pc = контрольная точка. Чтобы парабола ПРОХОДИЛА через peakPos при t=0.5:
+    -- peakPos = 0.25*start + 0.5*Pc + 0.25*end  =>  Pc = 2*peakPos - 0.5*(start+end)
+    local Pc = peakPos * 2 - (startPos + endPos) * 0.5
+
     for i = 1, TRAJ_SEGMENTS do
-        local t0 = flightTime * (i-1) / TRAJ_SEGMENTS
-        local t1 = flightTime * i     / TRAJ_SEGMENTS
-        local p0 = BallPos(t0)
-        local p1 = BallPos(t1)
+        local t0 = (i-1) / TRAJ_SEGMENTS
+        local t1 = i     / TRAJ_SEGMENTS
+        local function bezier(t)
+            local mt = 1 - t
+            return startPos * (mt*mt) + Pc * (2*mt*t) + endPos * (t*t)
+        end
+        local p0 = bezier(t0)
+        local p1 = bezier(t1)
         local s0, v0 = Camera:WorldToViewportPoint(p0)
         local s1, v1 = Camera:WorldToViewportPoint(p1)
         local l = TrajectoryLines[i]
@@ -436,7 +433,16 @@ local function CalcLaunchDir(startPos, targetPos)
     local corrY    = targetPos.Y + gravComp
     local dir      = (Vector3.new(targetPos.X, corrY, targetPos.Z) - startPos).Unit
     local cosAngle = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
-    local realT    = t  -- drag уже в t (flight time с затуханием)
+
+    -- Уточняем realT с учётом реального косинуса угла (1 итерация достаточно).
+    -- Горизонтальная скорость = V*cosAngle, поэтому время полёта длиннее при крутых углах.
+    local realT
+    if k < 1e-5 then
+        realT = (cosAngle > 0.01) and (horizDist / (V * cosAngle)) or t
+    else
+        local kdCos = math.min(k * horizDist / math.max(V * cosAngle, 1), 0.990)
+        realT = -math.log(1 - kdCos) / k
+    end
 
     return dir, horizDist, realT
 end
@@ -498,7 +504,12 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             if isLobShot then
                 if pgkY < GoalHeight * 0.55 then score = score + 5.0 end
                 if isAggressive             then score = score + 7.0 end
+                -- На малых дистанциях навес бесполезен — мяч не успевает подняться
+                if dist < 50 then score = score - 12.0 end
             end
+
+            -- На близких дистанциях (<45 studs) штраф за очень высокие точки (>85% H)
+            if dist < 45 and localY > GoalHeight * 0.82 then score = score - 8.0 end
 
             -- Центр: штраф
             if math.abs(localX) < halfW * 0.15 then score = score - 3.5 end
@@ -566,10 +577,15 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
 
             -- *** БАЛЛИСТИКА: рассчитываем LaunchDir с учётом гравитации + трения ***
             local launchDir, horizD, flightT = CalcLaunchDir(startPos, shootPos)
-            local trajOk = (launchDir.Y < 0.85)  -- угол <58° — нормально
+            -- sinTheta = launchDir.Y. sinTheta > 0.64 → угол > 40° (слишком крутой для обычного удара)
+            local launchAngleDeg = math.deg(math.asin(math.clamp(launchDir.Y, -1, 1)))
+            local trajOk = (launchAngleDeg < 42)  -- больше 42° — крутой, штраф
 
-            -- Штраф если траектория невозможна при данном power
-            if not trajOk then score = score - 5.0 end
+            -- Штраф за крутую траекторию (выше 42° = риск перелёта)
+            if not trajOk then
+                score = score - 5.0
+                if launchAngleDeg > 55 then score = score - 6.0 end  -- очень крутой = сильный штраф
+            end
 
             -- AimPoint: где физически находится мяч в момент пересечения плоскости ворот
             -- Это точка на НАШЕЙ параболе при t=flightT (должна совпасть с shootPos если формула верна)
@@ -972,7 +988,7 @@ AutoShoot.Start = function()
 
         -- 🟠 Траектория дуги (оранжевые линии) — главный визуал
         if hasTarget and CurrentLaunchDir and CurrentFlightTime > 0 then
-            DrawTrajectory(GetBallStartPos(), CurrentLaunchDir, CurrentFlightTime)
+            DrawTrajectory(GetBallStartPos(), CurrentPeakPos, PredictedLand)
         else
             for _, l in ipairs(TrajectoryLines) do l.Visible = false end
         end
@@ -1102,11 +1118,11 @@ local function SetupUI(UI)
         }, "AutoShootMaxDist")
 
         uiElements.AutoShootBallSpeed = UI.Sections.AutoShoot:Slider({
-            Name = "Ball Speed", Minimum = 100, Maximum = 800,
+            Name = "Ball Speed", Minimum = 100, Maximum = 1000,
             Default = AutoShootBallSpeed, Precision = 1,
             Callback = function(v) AutoShootBallSpeed = v end
         }, "AutoShootBallSpeed")
-        UI.Sections.AutoShoot:SubLabel({Text = "[↑] Мяч выше цели → увеличь  |  Мяч ниже → уменьши"})
+        UI.Sections.AutoShoot:SubLabel({Text = "~400 studs/s. Мяч выше цели → увеличь | Мяч ниже → уменьши"})
 
         uiElements.AutoShootDragComp = UI.Sections.AutoShoot:Slider({
             Name = "Drag Compensation", Minimum = 0, Maximum = 1.0,
