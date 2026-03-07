@@ -88,14 +88,29 @@ end
 -- 3D КУБЫ: зелёный = выбранная цель, красный = зона ворот, голубой = NoSpin
 -- ============================================================
 local TargetCube, GoalCube, NoSpinCube = {}, {}, {}
+local TRAJ_SEGMENTS = 20               -- кол-во сегментов дуги траектории
+local TrajectoryLines = {}             -- оранжевая пунктирная дуга
+local PeakCube = {}                    -- жёлтый бокс: пик траектории
 local function InitializeCubes()
     for i = 1, 12 do
         if TargetCube[i] and TargetCube[i].Remove then TargetCube[i]:Remove() end
         if GoalCube[i]   and GoalCube[i].Remove   then GoalCube[i]:Remove()   end
         if NoSpinCube[i] and NoSpinCube[i].Remove  then NoSpinCube[i]:Remove()  end
+        if PeakCube[i]   and PeakCube[i].Remove    then PeakCube[i]:Remove()    end
         TargetCube[i] = Drawing.new("Line")
         GoalCube[i]   = Drawing.new("Line")
         NoSpinCube[i] = Drawing.new("Line")
+        PeakCube[i]   = Drawing.new("Line")
+    end
+    -- Траектория: TRAJ_SEGMENTS линий
+    for i = 1, TRAJ_SEGMENTS do
+        if TrajectoryLines[i] and TrajectoryLines[i].Remove then TrajectoryLines[i]:Remove() end
+        TrajectoryLines[i] = Drawing.new("Line")
+        TrajectoryLines[i].Color        = Color3.fromRGB(255, 165, 0)  -- оранжевый
+        TrajectoryLines[i].Thickness    = 2
+        TrajectoryLines[i].Transparency = 0.4
+        TrajectoryLines[i].ZIndex       = 999
+        TrajectoryLines[i].Visible      = false
     end
     local function SC(cube, color, th)
         for _, l in ipairs(cube) do
@@ -103,9 +118,35 @@ local function InitializeCubes()
             l.Transparency = 0.7; l.ZIndex = 1000; l.Visible = false
         end
     end
-    SC(TargetCube, Color3.fromRGB(0,255,0),   6)  -- зелёный = куда летит мяч
-    SC(GoalCube,   Color3.fromRGB(255,0,0),   4)  -- красный = желаемое место попадания (scored target)
-    SC(NoSpinCube, Color3.fromRGB(0,255,255), 5)  -- голубой = без спина
+    SC(TargetCube, Color3.fromRGB(0,255,0),   5)   -- 🟢 зелёный = AimPoint (куда направлен ствол)
+    SC(GoalCube,   Color3.fromRGB(255,0,0),   5)   -- 🔴 красный = PredictedLand (куда УПАДЁТ мяч)
+    SC(NoSpinCube, Color3.fromRGB(0,200,255), 3)   -- 🔵 голубой = габарит ворот
+    SC(PeakCube,   Color3.fromRGB(255,255,0), 4)   -- 🟡 жёлтый = пик дуги
+end
+
+-- Рисует паработическую дугу полёта мяча (оранжевые линии)
+-- startPos: откуда, launchDir: единичный вектор вылета, speed: studs/s, flightTime: сек
+local function DrawTrajectory(startPos, launchDir, speed, flightTime, peakPos)
+    local vx = launchDir.X * speed
+    local vy = launchDir.Y * speed
+    local vz = launchDir.Z * speed
+    local prevScreen = nil
+    for i = 1, TRAJ_SEGMENTS do
+        local t0 = flightTime * (i-1) / TRAJ_SEGMENTS
+        local t1 = flightTime * i     / TRAJ_SEGMENTS
+        local p0 = startPos + Vector3.new(vx*t0, vy*t0 - 0.5*GRAVITY*t0*t0, vz*t0)
+        local p1 = startPos + Vector3.new(vx*t1, vy*t1 - 0.5*GRAVITY*t1*t1, vz*t1)
+        local s0, v0 = Camera:WorldToViewportPoint(p0)
+        local s1, v1 = Camera:WorldToViewportPoint(p1)
+        local l = TrajectoryLines[i]
+        if v0 and v1 and s0.Z > 0 and s1.Z > 0 then
+            l.From    = Vector2.new(s0.X, s0.Y)
+            l.To      = Vector2.new(s1.X, s1.Y)
+            l.Visible = true
+        else
+            l.Visible = false
+        end
+    end
 end
 
 local function DrawOrientedCube(cube, cframe, size)
@@ -298,8 +339,12 @@ end
 -- Берём низкоугольное решение (более прямой удар).
 -- ============================================================
 local TargetPoint, ShootDir, ShootVel, CurrentSpin, CurrentPower, CurrentType
-local AimPoint        = nil  -- зелёный бокс: куда направлен ShootDir
-local PredictedLand   = nil  -- красный бокс:  где мяч приземлится (=idealPos)
+local AimPoint          = nil
+local PredictedLand     = nil
+local CurrentFlightTime = 0
+local CurrentLaunchDir  = nil
+local CurrentSpeed      = 0
+local CurrentPeakPos    = nil
 local LastShoot = 0
 local CanShoot  = true
 
@@ -356,10 +401,11 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
     local startPos = HumanoidRootPart.Position
     local halfW    = GoalWidth / 2 - INSET
 
-    -- Сетка кандидатов: 5 позиций по X, 3 по высоте
-    -- Высоты: 20% / 50% / 80% от реальной высоты ворот
-    local xPoints = {-halfW, -halfW * 0.55, 0, halfW * 0.55, halfW}
-    local yFracs  = {0.20, 0.50, 0.80}
+    -- Сетка кандидатов: 7 × 5 = 35 точек
+    -- Включает верхние и нижние углы, пост-хаг зоны
+    local xPoints = {-halfW, -halfW*0.7, -halfW*0.35, 0, halfW*0.35, halfW*0.7, halfW}
+    -- yFracs: 10%=низкий, 30%=нижний угол, 55%=середина, 78%=верхний угол, 93%=самый верх
+    local yFracs  = {0.10, 0.30, 0.55, 0.78, 0.93}
 
     local candidates = {}
 
@@ -371,25 +417,39 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
             -- 3D позиция цели (idealPos) — точка в плоскости ворот
             local idealPos = GoalCFrame * Vector3.new(localX, localY, 0)
 
-            -- Score: чем дальше от вратаря — тем лучше
+            -- === SCORING ===
+            -- 1. Ключевой критерий: 2D расстояние от GK до точки в плоскости ворот
             local gkDistX  = math.abs(gkX - localX)
             local gkDistY  = math.abs(gkY - localY)
             local gkDist2D = math.sqrt(gkDistX*gkDistX + gkDistY*gkDistY)
-            local score    = gkDist2D * 2.0
+            local score    = gkDist2D * 2.5  -- основной вес
 
-            -- Бонус угловые зоны
-            if math.abs(localX) > halfW * 0.6 then score = score + 3.0 end
-            -- Бонус низкий мяч если GK стоит высоко
-            if gkY > GoalHeight * 0.5 and localY < GoalHeight * 0.3 then score = score + 4.0 end
-            -- Штраф центр
-            if math.abs(localX) < halfW * 0.2 then score = score - 2.0 end
+            -- 2. Бонус верхние углы: труднее всего для GK (нужен прыжок + смещение)
+            local isTopCorner = (localY > GoalHeight * 0.70) and (math.abs(localX) > halfW * 0.55)
+            local isCorner    = math.abs(localX) > halfW * 0.55
+            local isTop       = localY > GoalHeight * 0.70
+            if isTopCorner then score = score + 6.0 end  -- топ-угол — самый ценный
+            if isCorner    then score = score + 2.5 end  -- любой угол
+            if isTop and not isTopCorner then score = score + 1.5 end  -- верх по центру
 
-            -- Штраф если GK rush и он прямо на пути
+            -- 3. Штраф за центр (GK стартует по центру)
+            if math.abs(localX) < halfW * 0.15 then score = score - 3.0 end
+
+            -- 4. GK высоко → низкий мяч выгоднее
+            if gkY > GoalHeight * 0.55 and localY < GoalHeight * 0.25 then score = score + 5.0 end
+
+            -- 5. "Дальний угол" бонус: угол противоположный от игрока
+            local playerLocalX = GoalCFrame:PointToObjectSpace(startPos).X
+            local isFarCorner  = (playerLocalX > 0 and localX < -halfW*0.4)
+                               or (playerLocalX < 0 and localX >  halfW*0.4)
+            if isFarCorner then score = score + 3.0 end
+
+            -- 6. GK rush — штраф если он прямо на пути, бонус если уходим
             if isAggressive and gkHrp then
                 local shootVec = (idealPos - startPos).Unit
                 local gkVec    = (gkHrp.Position - startPos).Unit
                 local dot = shootVec:Dot(gkVec)
-                score = score + (dot > 0.92 and -8.0 or 5.0)
+                score = score + (dot > 0.92 and -10.0 or 6.0)
             end
 
             -- Power по дистанции
@@ -446,19 +506,34 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
                 aimPoint = shootPos
             end
 
+            -- Время полёта (для рисования дуги)
+            local cosH = math.sqrt(launchDir.X^2 + launchDir.Z^2)
+            local horizToShoot = Vector3.new(shootPos.X-startPos.X, 0, shootPos.Z-startPos.Z).Magnitude
+            local flightTime = (cosH > 0.01) and (horizToShoot / (speed * cosH)) or 0.5
+            -- Пик дуги: момент когда vy - g*t = 0
+            local vyComp  = launchDir.Y * speed
+            local tPeak   = math.max(vyComp / GRAVITY, 0)
+            local peakPos = startPos + Vector3.new(
+                launchDir.X * speed * tPeak,
+                launchDir.Y * speed * tPeak - 0.5 * GRAVITY * tPeak * tPeak,
+                launchDir.Z * speed * tPeak
+            )
             table.insert(candidates, {
-                idealPos  = idealPos,    -- красный бокс: куда прилетит мяч
-                aimPoint  = aimPoint,    -- зелёный бокс: куда направлен ствол
-                shootPos  = shootPos,    -- целевая точка с деривацией (для отладки)
-                launchDir = launchDir,   -- направление вылета (с дугой!)
-                localX    = localX,
-                localY    = localY,
-                spin      = spinDir,
-                power     = power,
-                speed     = speed,
-                score     = score,
-                gkDist    = gkDist2D,
-                trajOk    = trajOk,
+                idealPos   = idealPos,
+                aimPoint   = aimPoint,
+                shootPos   = shootPos,
+                launchDir  = launchDir,
+                localX     = localX,
+                localY     = localY,
+                spin       = spinDir,
+                power      = power,
+                speed      = speed,
+                score      = score,
+                gkDist     = gkDist2D,
+                trajOk     = trajOk,
+                flightTime = flightTime,
+                peakPos    = peakPos,
+                isTopCorner = isTopCorner,
             })
         end
     end
@@ -498,21 +573,25 @@ local function CalculateTarget()
         return
     end
 
-    -- ShootDir = баллистический вектор (с учётом дуги), НЕ прямая линия к цели
     ShootDir       = result.launchDir
     ShootVel       = ShootDir * result.speed
     CurrentSpin    = result.spin
     CurrentPower   = result.power
-    CurrentType    = string.format("X=%.1f Y=%.1f gk=%.1f%s",
-                        result.localX, result.localY, result.gkDist,
-                        result.trajOk and "" or " [!arc]")
+    CurrentType    = string.format("%sX=%.1f Y=%.1f/%.1f gk=%.1f",
+                        result.isTopCorner and "[TC] " or "",
+                        result.localX, result.localY, GoalHeight, result.gkDist)
 
-    -- Боксы:
-    -- Красный = куда ПРИЛЕТИТ мяч (предикция по траектории = idealPos)
-    -- Зелёный = куда направлен ствол (aimPoint, выше цели из-за дуги)
-    PredictedLand  = result.idealPos
-    AimPoint       = result.aimPoint
-    TargetPoint    = result.shootPos  -- для совместимости (hasBall check)
+    -- 🔴 Красный = PredictedLand: куда мяч ПРИЛЕТИТ (= idealPos в плоскости ворот)
+    -- 🟢 Зелёный = AimPoint: куда направлен ствол (выше цели из-за дуги гравитации)
+    -- 🟡 Жёлтый  = PeakPoint: наивысшая точка дуги (виден подъём мяча)
+    -- 🟠 Оранж.  = TrajectoryLines: вся дуга полёта
+    PredictedLand    = result.idealPos
+    AimPoint         = result.aimPoint
+    CurrentFlightTime = result.flightTime
+    CurrentLaunchDir  = result.launchDir
+    CurrentSpeed      = result.speed
+    CurrentPeakPos    = result.peakPos
+    TargetPoint       = result.shootPos
 
     if Gui then
         Gui.Target.Text = string.format("→ X=%.1f Y=%.1f/%.1f", result.localX, result.localY, GoalHeight)
@@ -673,22 +752,37 @@ AutoShoot.Start = function()
 
     AutoShootStatus.RenderConnection = RunService.RenderStepped:Connect(function()
         local width = UpdateGoal()
+        local hasTarget = TargetPoint ~= nil
 
-        -- 🟢 Зелёный = AimPoint (куда направлен ShootDir с учётом дуги; выше цели)
+        -- 🟠 Траектория дуги (оранжевые линии) — главный визуал
+        if hasTarget and CurrentLaunchDir and CurrentFlightTime > 0 then
+            DrawTrajectory(HumanoidRootPart.Position, CurrentLaunchDir, CurrentSpeed, CurrentFlightTime)
+        else
+            for _, l in ipairs(TrajectoryLines) do l.Visible = false end
+        end
+
+        -- 🟢 Зелёный = AimPoint (куда смотрит ствол с поправкой на гравитацию)
         if AimPoint then
-            DrawOrientedCube(TargetCube, CFrame.new(AimPoint), Vector3.new(3,3,3))
+            DrawOrientedCube(TargetCube, CFrame.new(AimPoint), Vector3.new(2,2,2))
         else
             for _, l in ipairs(TargetCube) do l.Visible = false end
         end
 
-        -- 🔴 Красный = PredictedLand (куда МЯЧ ПРИЛЕТИТ с учётом траектории = idealPos)
+        -- 🔴 Красный = PredictedLand (куда мяч прилетит — предикция траектории)
         if PredictedLand then
-            DrawOrientedCube(GoalCube, CFrame.new(PredictedLand), Vector3.new(3,3,3))
+            DrawOrientedCube(GoalCube, CFrame.new(PredictedLand), Vector3.new(2.5,2.5,2.5))
         else
             for _, l in ipairs(GoalCube) do l.Visible = false end
         end
 
-        -- 🔵 Голубой = габарит ворот (W × H) — реальные размеры
+        -- 🟡 Жёлтый = пик дуги (наивысшая точка полёта)
+        if CurrentPeakPos and hasTarget then
+            DrawOrientedCube(PeakCube, CFrame.new(CurrentPeakPos), Vector3.new(2,2,2))
+        else
+            for _, l in ipairs(PeakCube) do l.Visible = false end
+        end
+
+        -- 🔵 Голубой = реальный габарит ворот (W × H)
         if GoalCFrame and width and GoalHeight then
             DrawOrientedCube(NoSpinCube, GoalCFrame * CFrame.new(0, GoalHeight/2, 0),
                 Vector3.new(width, GoalHeight, 1))
@@ -708,6 +802,10 @@ AutoShoot.Stop = function()
         if TargetCube[i] and TargetCube[i].Remove then TargetCube[i]:Remove() end
         if GoalCube[i]   and GoalCube[i].Remove   then GoalCube[i]:Remove()   end
         if NoSpinCube[i] and NoSpinCube[i].Remove  then NoSpinCube[i]:Remove()  end
+        if PeakCube[i]   and PeakCube[i].Remove    then PeakCube[i]:Remove()    end
+    end
+    for i = 1, TRAJ_SEGMENTS do
+        if TrajectoryLines[i] and TrajectoryLines[i].Remove then TrajectoryLines[i]:Remove() end
     end
     if AutoShootStatus.ButtonGui then AutoShootStatus.ButtonGui:Destroy(); AutoShootStatus.ButtonGui = nil end
 end
@@ -856,6 +954,7 @@ function AutoShootModule.Init(UI, coreParam, notifyFunc)
         RShootAnim       = Humanoid:LoadAnimation(Animations:WaitForChild("RShoot"))
         RShootAnim.Priority = Enum.AnimationPriority.Action4
         GoalCFrame = nil; TargetPoint = nil; PredictedLand = nil; AimPoint = nil
+        CurrentFlightTime = 0; CurrentLaunchDir = nil; CurrentSpeed = 0; CurrentPeakPos = nil
         LastShoot = 0; IsAnimating = false; CanShoot = true
         if AutoShootEnabled then AutoShoot.Start() end
         if AutoPickupEnabled then AutoPickup.Start() end
