@@ -44,7 +44,9 @@ local GRAVITY              = 196.2   -- studs/s² (Roblox workspace gravity)
 local AutoShootBallSpeed   = 380     -- Скорость мяча studs/s. Мяч выше цели → увеличь. Мяч ниже → уменьши.
 local AutoShootDragComp    = 0.10    -- Компенсация трения (studs / stud дистанции × 0.01). Мяч не долетает → увеличь.
 local FIXED_POWER          = 5.0    -- Power отправляемый на сервер (не влияет на траекторию, константа)
-local INSET                = 1.5    -- отступ от штанг внутрь (studs)
+local BALL_RADIUS           = 1.168  -- радиус мяча: 2.336 / 2 studs
+-- Безопасный отступ = радиус мяча + небольшой запас чтобы мяч не касался штанги
+local INSET                = BALL_RADIUS + 0.35  -- ~1.52 studs
 
 -- ============================================================
 -- STATUS
@@ -188,6 +190,17 @@ end
 -- ОПРЕДЕЛЕНИЕ ВОРОТ — полностью автоматически по реальным позициям стоек
 -- Не используем никаких Y-offset — берём реальные координаты из мира
 -- ============================================================
+-- Начальная позиция мяча: Character.ball (реальное положение мяча на поле),
+-- а не HumanoidRootPart (центр тела игрока, сдвинут на ~1-3 stud)
+local function GetBallStartPos()
+    local ballPart = Character:FindFirstChild("ball")
+    if ballPart then
+        if ballPart:IsA("BasePart")   then return ballPart.Position     end
+        if ballPart:IsA("Attachment") then return ballPart.WorldPosition end
+    end
+    return HumanoidRootPart.Position
+end
+
 local GoalCFrame, GoalWidth, GoalHeight, GoalFloorY
 local function UpdateGoal()
     local myTeam, enemyGoalName = (function()
@@ -408,7 +421,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
     if not GoalCFrame or not GoalWidth or not GoalHeight then return nil end
     if dist > AutoShootMaxDistance then return nil end
 
-    local startPos = HumanoidRootPart.Position
+    local startPos = GetBallStartPos()  -- реальная позиция мяча, не HRP!
     local halfW    = GoalWidth / 2 - INSET
 
     -- Сетка кандидатов: 7 × 5 = 35 точек
@@ -489,7 +502,9 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
             end
 
             -- shootPos = с учётом деривации (реальная точка куда направляем мяч)
-            local shootLocalX = math.clamp(localX + derivation, -GoalWidth/2+0.3, GoalWidth/2-0.3)
+            -- Clamp: центр мяча должен быть минимум BALL_RADIUS от внутреннего края штанги
+            local safeEdge    = GoalWidth/2 - BALL_RADIUS
+            local shootLocalX = math.clamp(localX + derivation, -safeEdge, safeEdge)
             local shootPos    = GoalCFrame * Vector3.new(shootLocalX, localY, 0)
 
             -- *** БАЛЛИСТИКА: рассчитываем LaunchDir с учётом гравитации + трения ***
@@ -544,6 +559,116 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
         end
     end
 
+    -- ================================================================
+    -- РИКОШЕТЫ ОТ ШТАНГ
+    -- Мяч намеренно бьётся об внутреннюю грань штанги и отскакивает в ворота.
+    -- Полезно когда вратарь перекрывает прямой путь, а угловой путь заблокирован.
+    -- Геометрия:
+    --   Центр мяча при касании штанги = innerEdge + BALL_RADIUS (в сторону центра)
+    --   Нормаль отражения = горизонтальный вектор от штанги к центру ворот
+    --   d_out = d_in - 2*(d_in·n)*n
+    -- ================================================================
+    local ricochetEnabled = (dist > 15)  -- рикошет бесполезен вплотную
+    if ricochetEnabled then
+        local postDefs = {
+            { side =  1, postLocalX = -GoalWidth/2 },  -- левая штанга, нормаль = +X (вправо)
+            { side = -1, postLocalX =  GoalWidth/2 },  -- правая штанга, нормаль = -X (влево)
+        }
+        -- Нормаль отражения: от штанги к центру ворот (горизонтальная)
+        -- side=+1 → левая штанга → нормаль смотрит вправо (+X в goal local)
+        -- side=-1 → правая штанга → нормаль смотрит влево (-X в goal local)
+        for _, pd in ipairs(postDefs) do
+            local normalLocal = Vector3.new(pd.side, 0, 0)
+            local nWorld      = GoalCFrame:VectorToWorldSpace(normalLocal)
+
+            for _, hf in ipairs({0.20, 0.45, 0.72}) do
+                local hitY      = hf * GoalHeight
+                -- Центр мяча в момент касания: на BALL_RADIUS кнутри от внутренней грани штанги
+                local hitLocalX = pd.postLocalX + pd.side * BALL_RADIUS
+                local hitWorld  = GoalCFrame * Vector3.new(hitLocalX, hitY, 0)
+
+                -- Вектор прихода мяча (без вертикальной коррекции — для вычисления отражения)
+                local dInFlat = Vector3.new(
+                    hitWorld.X - startPos.X, 0, hitWorld.Z - startPos.Z
+                ).Unit
+
+                -- Отражение: d_out = d_in - 2*(d_in·n)*n
+                local dotVal = dInFlat:Dot(nWorld)
+                local dOut   = (dInFlat - 2 * dotVal * nWorld).Unit
+
+                -- Проверяем что dOut смотрит в сторону ворот (по глубине)
+                -- GoalCFrame.LookVector = направление "в ворота" от поля
+                local dOutLocalZ = GoalCFrame:VectorToObjectSpace(dOut).Z
+                -- В нашей CFrame Z+ = к полю, Z- = в глубину ворот
+                -- Нам нужно dOut.Z < 0 (в глубину ворот) ИЛИ вдоль ворот — принимаем оба
+                local goesIn = (dOutLocalZ < 0.1)
+
+                if goesIn then
+                    -- Примерная точка приземления: двигаемся вглубь ворот на 5 studs
+                    local landWorld  = hitWorld + dOut * 5
+                    local landLocal  = GoalCFrame:PointToObjectSpace(landWorld)
+                    local landX      = landLocal.X
+                    local landY      = landLocal.Y
+
+                    -- Scoring: как далеко от вратаря место приземления?
+                    local rgkDistX  = math.abs(gkX - landX)
+                    local rgkDistY  = math.abs(gkY - landY)
+                    local rgkDist   = math.sqrt(rgkDistX*rgkDistX + rgkDistY*rgkDistY)
+                    local rscore    = rgkDist * 2.5
+
+                    -- Бонус если рикошет перебрасывает мяч на противоположную сторону от GK
+                    local crossSide = (gkX > 0 and landX < -GoalWidth*0.15)
+                                   or (gkX < 0 and landX >  GoalWidth*0.15)
+                    if crossSide then rscore = rscore + 5.0 end
+
+                    -- Лёгкий штраф за сложность попадания в точку рикошета
+                    rscore = rscore - 1.5
+
+                    -- LaunchDir на точку касания (с гравитационной коррекцией)
+                    local rLaunchDir, rHorizD, rFlightT = CalcLaunchDir(startPos, hitWorld)
+                    local rcosA = math.sqrt(rLaunchDir.X^2 + rLaunchDir.Z^2)
+                    local rAimPoint
+                    if rcosA > 0.01 then
+                        rAimPoint = Vector3.new(
+                            startPos.X + rLaunchDir.X * AutoShootBallSpeed * rFlightT,
+                            startPos.Y + rLaunchDir.Y * AutoShootBallSpeed * rFlightT
+                                       - 0.5 * GRAVITY * rFlightT * rFlightT,
+                            startPos.Z + rLaunchDir.Z * AutoShootBallSpeed * rFlightT
+                        )
+                    else rAimPoint = hitWorld end
+
+                    local ryComp  = rLaunchDir.Y * AutoShootBallSpeed
+                    local rtPeak  = math.max(ryComp / GRAVITY, 0)
+                    local rPeak   = Vector3.new(
+                        startPos.X + rLaunchDir.X * AutoShootBallSpeed * rtPeak,
+                        startPos.Y + rLaunchDir.Y * AutoShootBallSpeed * rtPeak
+                                   - 0.5 * GRAVITY * rtPeak * rtPeak,
+                        startPos.Z + rLaunchDir.Z * AutoShootBallSpeed * rtPeak
+                    )
+
+                    table.insert(candidates, {
+                        idealPos    = hitWorld,    -- красный бокс = точка касания штанги
+                        aimPoint    = rAimPoint,
+                        shootPos    = hitWorld,
+                        launchDir   = rLaunchDir,
+                        localX      = hitLocalX,
+                        localY      = hitY,
+                        spin        = "None",      -- для рикошета спин не нужен
+                        power       = FIXED_POWER,
+                        speed       = AutoShootBallSpeed,
+                        score       = rscore,
+                        gkDist      = rgkDist,
+                        trajOk      = (rLaunchDir.Y < 0.85),
+                        flightTime  = rFlightT,
+                        peakPos     = rPeak,
+                        isTopCorner = false,
+                        isRicochet  = true,
+                    })
+                end
+            end
+        end
+    end
+
     if #candidates == 0 then return nil end
     table.sort(candidates, function(a,b) return a.score > b.score end)
     return candidates[1]
@@ -560,7 +685,7 @@ local function CalculateTarget()
         return
     end
 
-    local dist = (HumanoidRootPart.Position - GoalCFrame.Position).Magnitude
+    local dist = (GetBallStartPos() - GoalCFrame.Position).Magnitude
     if Gui then
         Gui.Dist.Text = string.format("Dist: %.0f | Goal: %.0f×%.0f", dist, GoalWidth, GoalHeight)
     end
@@ -585,9 +710,9 @@ local function CalculateTarget()
     ShootVel       = ShootDir * (FIXED_POWER * 1400)
     CurrentSpin    = result.spin
     CurrentPower   = FIXED_POWER  -- power константа, не влияет на траекторию
+    local typePrefix = result.isRicochet and "[RIC] " or (result.isTopCorner and "[TC] " or "")
     CurrentType    = string.format("%sX=%.1f Y=%.1f/%.1f gk=%.1f",
-                        result.isTopCorner and "[TC] " or "",
-                        result.localX, result.localY, GoalHeight, result.gkDist)
+                        typePrefix, result.localX, result.localY, GoalHeight, result.gkDist)
 
     -- 🔴 Красный = PredictedLand: куда мяч ПРИЛЕТИТ (= idealPos в плоскости ворот)
     -- 🟢 Зелёный = AimPoint: куда направлен ствол (выше цели из-за дуги гравитации)
@@ -728,7 +853,7 @@ AutoShoot.Start = function()
         pcall(CalculateTarget)
         local ball    = Workspace:FindFirstChild("ball")
         local hasBall = ball and ball:FindFirstChild("playerWeld") and ball.creator.Value == LocalPlayer
-        local dist    = GoalCFrame and (HumanoidRootPart.Position - GoalCFrame.Position).Magnitude or 999
+        local dist    = GoalCFrame and (GetBallStartPos() - GoalCFrame.Position).Magnitude or 999
 
         if hasBall and TargetPoint and dist <= AutoShootMaxDistance then
             if Gui then
@@ -768,7 +893,7 @@ AutoShoot.Start = function()
 
         -- 🟠 Траектория дуги (оранжевые линии) — главный визуал
         if hasTarget and CurrentLaunchDir and CurrentFlightTime > 0 then
-            DrawTrajectory(HumanoidRootPart.Position, CurrentLaunchDir, CurrentFlightTime)
+            DrawTrajectory(GetBallStartPos(), CurrentLaunchDir, CurrentFlightTime)
         else
             for _, l in ipairs(TrajectoryLines) do l.Visible = false end
         end
