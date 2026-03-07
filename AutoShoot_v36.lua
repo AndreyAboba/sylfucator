@@ -326,7 +326,8 @@ local function GetEnemyGoalie()
         -- localX: смещение от центра ворот (+ = правая стойка, - = левая)
         -- localY: высота от пола ворот
         local localX = local3.X
-        local localY = hrp.Position.Y - GoalCFrame.Position.Y
+        -- Используем local3.Y: GoalCFrame начало = пол ворот → Y = высота над полом (правильно!)
+        local localY = local3.Y
         local distGoal = (hrp.Position - GoalCFrame.Position).Magnitude
         local isInGoal = distGoal < 20 and math.abs(localX) < halfW + 3
         table.insert(goalies, {
@@ -381,8 +382,8 @@ local function GetEnemyGoalie()
     end
     GkTrack[best.name] = { pos = best.hrp.Position, time = now, vel = vel }
 
-    -- localY: высота от реального пола ворот
-    best.localY = best.hrp.Position.Y - (GoalFloorY or GoalCFrame.Position.Y)
+    -- localY: GoalCFrame:PointToObjectSpace даёт Y = высота над полом ворот
+    best.localY = GoalCFrame:PointToObjectSpace(best.hrp.Position).Y
 
     local isAggressive = not best.isInGoal
     if Gui then
@@ -486,7 +487,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
     local gkPredW    = gkHrp and (gkHrp.Position + gkVel * math.min(approxT, 0.8)) or nil
     local gkPredLoc  = gkPredW and GoalCFrame:PointToObjectSpace(gkPredW) or nil
     local pgkX       = gkPredLoc and gkPredLoc.X or gkX
-    local pgkY       = gkPredLoc and (gkPredW.Y - (GoalFloorY or GoalCFrame.Position.Y)) or gkY
+    local pgkY       = gkPredLoc and GoalCFrame:PointToObjectSpace(gkPredW).Y or gkY
     -- Зона дайва GK: статичный радиус + то что успеет пробежать за time
     -- diveRange: предикт GK уже сдвинут на approxT*gkVel (см. gkPredW выше).
     -- Здесь diveRange = только физический рывок из предиктной позиции.
@@ -516,7 +517,10 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             local gkDistY   = math.abs(gkY - localY)
             local gkDist2D  = math.sqrt(gkDistX*gkDistX + gkDistY*gkDistY)
             local pgkDistX  = math.abs(pgkX - localX)
-            local pgkDistY  = math.abs(pgkY - localY)
+            -- GK: прыжок ВВЕРХ сложнее чем нырок вниз. Смещаем эффективный Y вниз
+            -- → высокие цели оцениваются как более труднодосягаемые для GK.
+            local gkEffY    = math.max(0, pgkY - GoalHeight * 0.22)
+            local pgkDistY  = math.abs(gkEffY - localY)
             local pgkDist2D = math.sqrt(pgkDistX*pgkDistX + pgkDistY*pgkDistY)
 
             -- Основа: расстояние предиктной позиции GK от точки
@@ -524,19 +528,22 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             local reachability = math.clamp(1 - pgkDist2D / diveRange, 0, 1)
             local score = pgkDist2D * 2.8 - reachability * 9.0
 
-            local isTopCorner = (yf >= 0.70) and (math.abs(localX) > halfW * 0.5)
+            local isTopCorner = (yf >= 0.60) and (math.abs(localX) > halfW * 0.5)
             local isCorner    = math.abs(localX) > halfW * 0.5
             local isLobShot   = (yf >= 0.85)
 
             -- Верхние углы: прыжок + смещение = труднее всего
-            if isTopCorner then score = score + 11.0 end
-            if isCorner and not isTopCorner then score = score + 3.5 end
+            if isTopCorner then score = score + 13.0 end
+            if isCorner and not isTopCorner then score = score + 4.0 end
 
-            -- Разные типы атак: дальние поощряют верх/свечки, ближние гасят только верх.
             local hFrac = localY / math.max(yRange, 1)
-            score = score + hFrac * math.clamp((dist - 85) / 35, 0, 1) * 4.5
-            score = score - hFrac * hFrac * math.clamp((55 - dist) / 25, 0, 1) * 5.2
-            if isLobShot and dist > 75 then score = score + 4.5 end
+            -- Бонус за высоту: верхняя половина ворот всегда сложнее для GK
+            score = score + hFrac * 2.5
+            -- Дальние: дополнительный бонус за высоту (мяч падает круто)
+            score = score + hFrac * math.clamp((dist - 80) / 40, 0, 1) * 4.0
+            -- Ближние: штраф за слишком высокие цели (риск перелёта)
+            score = score - hFrac * hFrac * math.clamp((55 - dist) / 25, 0, 1) * 4.5
+            if isLobShot and dist > 70 then score = score + 5.0 end
 
             -- Навес: ценен когда GK низко или выходит вперёд
             if isLobShot then
@@ -558,17 +565,24 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
                              or (playerLocalX < -halfW*0.2 and localX >  halfW*0.4)
             if isFarCorner then score = score + 3.5 end
 
-            -- GK rush: прямо на пути = плохо, сбоку = хорошо
+            -- GK blocking check: всегда проверяем (не только при rush)
+            if gkHrp then
+                local toTarget = (idealPos - startPos).Unit
+                local toGK     = (gkHrp.Position - startPos)
+                local gkOnPath = toGK:Dot(toTarget) / math.max(toTarget.Magnitude, 1)
+                local gkPerp   = (toGK - toTarget * toGK:Dot(toTarget)).Magnitude
+                -- Если GK стоит поперёк траектории мяча (перпендикуляр < 2 studs)
+                if gkOnPath > 1 and gkPerp < 2.2 then
+                    score = score - 10.0  -- GK прямо на пути
+                end
+            end
             if isAggressive and gkHrp then
                 local dot = (idealPos - startPos).Unit:Dot((gkHrp.Position - startPos).Unit)
-                score = score + (dot > 0.90 and -12.0 or 7.0)
+                score = score + (dot > 0.90 and -12.0 or 8.0)
             end
-
-            -- Бонус если GK стоит у ОБОИХ углов одновременно (редкий сценарий),
-            -- в этом случае середина ворот является лучшей зоной
-            local gkBlockingBothCorners = math.abs(gkX) > halfW * 0.55
-            if gkBlockingBothCorners and math.abs(localX) < halfW * 0.3 then
-                score = score + 6.0  -- середина открыта!
+            -- GK у обоих углов → середина открыта
+            if math.abs(gkX) > halfW * 0.55 and math.abs(localX) < halfW * 0.3 then
+                score = score + 6.0
             end
 
             -- GK движется к точке: штраф
