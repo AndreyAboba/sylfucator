@@ -42,7 +42,7 @@ local AutoShootSpoofPowerType    = "math.huge"
 -- Физика
 local GRAVITY              = 196.2   -- studs/s² (Roblox workspace gravity)
 local AutoShootBallSpeed   = 400     -- Скорость мяча studs/s. Мяч выше цели → увеличь. Мяч ниже → уменьши.
-local AutoShootDragComp    = 1.0     -- k (1/s): экспоненц. затухание v_h=V·e^(-k·t). Не долетает → увеличь. Летит выше → уменьши.
+local AutoShootDragComp    = 1.05    -- k (1/s): экспоненц. затухание v_h=V·e^(-k·t). Не долетает → увеличь. Летит выше → уменьши.
 local FIXED_POWER          = 5.0
 local GK_REACH_RADIUS      = 5.0    -- Радиус статичного покрытия GK (studs)
 local GK_REACH_SPEED       = 12.0   -- Скорость реакции GK для предикта дайва (studs/s)
@@ -482,7 +482,11 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
     local pgkX       = gkPredLoc and gkPredLoc.X or gkX
     local pgkY       = gkPredLoc and (gkPredW.Y - (GoalFloorY or GoalCFrame.Position.Y)) or gkY
     -- Зона дайва GK: статичный радиус + то что успеет пробежать за time
-    local diveRange  = GK_REACH_RADIUS + GK_REACH_SPEED * approxT
+    -- diveRange: предикт GK уже сдвинут на approxT*gkVel (см. gkPredW выше).
+    -- Здесь diveRange = только физический рывок из предиктной позиции.
+    -- Небольшой бонус за время реакции, но без безграничного роста на дальних.
+    local reactionBonus = math.min(GK_REACH_SPEED * approxT * 0.25, 3.0)
+    local diveRange     = GK_REACH_RADIUS + reactionBonus
 
     local xPoints = {-halfW, -halfW*0.7, -halfW*0.35, 0, halfW*0.35, halfW*0.7, halfW}
     -- Добавлены навесные фракции 0.88 и 0.96
@@ -514,7 +518,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             local reachability = math.clamp(1 - pgkDist2D / diveRange, 0, 1)
             local score = pgkDist2D * 2.8 - reachability * 9.0
 
-            local isTopCorner = (localY > GoalHeight * 0.72) and (math.abs(localX) > halfW * 0.5)
+            local isTopCorner = (yf >= 0.70) and (math.abs(localX) > halfW * 0.5)
             local isCorner    = math.abs(localX) > halfW * 0.5
             local isLobShot   = (yf >= 0.85)
 
@@ -533,8 +537,9 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             -- На близких дистанциях (<45 studs) штраф за очень высокие точки (>85% H)
             if dist < 45 and localY > GoalHeight * 0.82 then score = score - 8.0 end
 
-            -- Центр: штраф
-            if math.abs(localX) < halfW * 0.15 then score = score - 3.5 end
+            -- Штраф за центр (но не слишком жёсткий — иначе скрипт бьёт только в углы)
+            local centerPenalty = math.max(0, 1 - math.abs(localX) / (halfW * 0.4)) * 2.5
+            score = score - centerPenalty
 
             -- Дальний угол (противоположный стороне игрока)
             local isFarCorner = (playerLocalX > halfW*0.2 and localX < -halfW*0.4)
@@ -545,6 +550,13 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             if isAggressive and gkHrp then
                 local dot = (idealPos - startPos).Unit:Dot((gkHrp.Position - startPos).Unit)
                 score = score + (dot > 0.90 and -12.0 or 7.0)
+            end
+
+            -- Бонус если GK стоит у ОБОИХ углов одновременно (редкий сценарий),
+            -- в этом случае середина ворот является лучшей зоной
+            local gkBlockingBothCorners = math.abs(gkX) > halfW * 0.55
+            if gkBlockingBothCorners and math.abs(localX) < halfW * 0.3 then
+                score = score + 6.0  -- середина открыта!
             end
 
             -- GK движется к точке: штраф
@@ -632,14 +644,19 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             -- ШТРАФ за прицел выше безопасной зоны (gravComp поднимает aim выше цели).
             -- aimPoint.Y ≈ targetPos.Y (куда мяч ПРИЛЕТИТ), а не куда мы ЦЕЛИМСЯ.
             -- Прицел = localY + gravComp. Безопасный максимум = GoalHeight - Y_TOP_INSET.
-            local gravCompHere = 0.5 * GRAVITY * flightT * flightT
-            local aimLocalY    = localY + gravCompHere   -- высота прицела внутри ворот
-            local safeTop      = GoalHeight - Y_TOP_INSET
-            if aimLocalY > safeTop then
-                local over = aimLocalY - safeTop
-                -- Штраф растёт квадратично: маленький перелёт — небольшой штраф,
-                -- большой перелёт (близкая дистанция + высокая цель) — очень большой
-                score = score - over * over * 6.0 - over * 4.0
+            -- Проверка перекладины: актуальна ТОЛЬКО если мяч ещё ПОДНИМАЕТСЯ при пересечении ворот.
+            -- На дальних дистанциях (>80 studs) мяч уже летит вниз (vy < 0) — перекладина не мешает.
+            -- vy(t) = V*launchDir.Y - g*t. Если vy > 0 — мяч ещё вверх = можно задеть перекладину.
+            local vyAtGoal = AutoShootBallSpeed * launchDir.Y - GRAVITY * flightT
+            if vyAtGoal > 0 then
+                -- Мяч поднимается: проверяем aim height против безопасного потолка
+                local gravCompHere = 0.5 * GRAVITY * flightT * flightT
+                local aimLocalY    = localY + gravCompHere
+                local safeTop      = GoalHeight - Y_TOP_INSET
+                if aimLocalY > safeTop then
+                    local over = aimLocalY - safeTop
+                    score = score - over * over * 6.0 - over * 4.0
+                end
             end
 
             -- flightTime уже рассчитан CalcLaunchDir
@@ -741,7 +758,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
                     local rpgkDistX = math.abs(pgkX - landX)
                     local rpgkDistY = math.abs(pgkY - landY)
                     local rpgkDist  = math.sqrt(rpgkDistX*rpgkDistX + rpgkDistY*rpgkDistY)
-                    local rReach    = math.clamp(1 - rpgkDist / diveRange, 0, 1)
+                    local rReach    = math.clamp(1 - rpgkDist / (GK_REACH_RADIUS + 2.0), 0, 1)
                     local rscore    = rpgkDist * 3.0 - rReach * 8.0
 
                     -- Мяч после рикошета летит на противоположную сторону от GK
