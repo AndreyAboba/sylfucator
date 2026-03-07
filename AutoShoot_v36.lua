@@ -55,8 +55,11 @@ local BALL_RADIUS           = 1.168  -- радиус мяча: 2.336 / 2 studs
 local INSET                = BALL_RADIUS + 0.55  -- ~1.72 studs (горизонтальный, от штанг)
 -- Вертикальный инсет: центр мяча должен быть минимум BALL_RADIUS от перекладины/пола
 -- Дополнительный запас 0.25 studs покрывает неточность физической модели
-local Y_TOP_INSET          = BALL_RADIUS + 0.50   -- 1.67 studs от перекладины
-local Y_BOT_INSET          = 0.30                 -- 0.30 studs от пола
+-- Y_TOP_TARGET: используется для сетки кандидатов (мал → можно целиться выше в ворота)
+local Y_TOP_TARGET         = BALL_RADIUS + 0.10   -- 1.27 studs от перекладины
+-- Y_TOP_SAFETY: используется в crossbar-штрафе (больше → жёстче защита от перелёта)
+local Y_TOP_SAFETY         = BALL_RADIUS + 0.48   -- 1.65 studs порог штрафа
+local Y_BOT_INSET          = 0.22                 -- studs от пола
 local GOAL_DEPTH_MIN         = 1.4                  -- минимально целимся внутрь ворот
 local GOAL_DEPTH_MAX         = 4.6                  -- максимально целимся вглубь на дальних
 local VIS_CURL_MAX           = 1.45                 -- max визуальный боковой Magnus изгиб
@@ -158,7 +161,9 @@ local function DrawTrajectory(startPos, peakPos, endPos, peakFrac)
     -- f = параметр t в котором находится peakPos.
     -- Зажат в [0.28, 0.58] чтобы Pc не улетал в бесконечность при очень малом f
     -- (плоские удары на близкой дистанции, где tPeak << flightTime).
-    local f = math.clamp(peakFrac or 0.40, 0.28, 0.58)
+    -- f фиксирован ≈ 0.40: peakPos сэмплирован при t=0.40*flightTime,
+    -- clamp [0.36, 0.44] сохраняет симметричность и убирает визуальный эффект "дуга в конце".
+    local f = math.clamp(peakFrac or 0.40, 0.36, 0.44)
     local Pc = (peakPos - startPos * ((1-f)^2) - endPos * (f^2))
                / math.max(2 * f * (1-f), 1e-4)
 
@@ -500,7 +505,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             local localX = xf
             -- Цель с учётом вертикального инсета: центр мяча никогда не доходит
             -- до перекладины или пола ближе чем на радиус мяча + запас точности.
-            local yRange = math.max(0.5, GoalHeight - Y_TOP_INSET - Y_BOT_INSET)
+            local yRange = math.max(0.5, GoalHeight - Y_TOP_TARGET - Y_BOT_INSET)
             local localY = Y_BOT_INSET + yf * yRange  -- гарантированно внутри ворот
 
             -- 3D позиция цели (idealPos) — точка в плоскости ворот
@@ -624,6 +629,8 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             if spinDir ~= "None" then
                 local dMult  = AutoShootDerivMult * (dist / 100)^2
                 derivation   = (spinDir == "Right" and 1 or -1) * dMult
+                -- Закрученный удар = труднее взять → небольшой дополнительный бонус
+                score = score + math.min(dMult * 0.4, 2.0)
             end
 
             -- shootPos = с учётом деривации (реальная точка куда направляем мяч)
@@ -675,7 +682,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
                 local gravCompHere = 0.5 * GRAVITY * flightT * flightT * gravRampHere
                 local aeroLossHere = 0.18 * AutoShootDragComp * AutoShootBallSpeed * flightT * flightT * gravRampHere
                 local aimLocalY    = localY + gravCompHere + aeroLossHere
-                local safeTop      = GoalHeight - Y_TOP_INSET
+                local safeTop      = GoalHeight - Y_TOP_SAFETY
                 if aimLocalY > safeTop then
                     local over = aimLocalY - safeTop
                     score = score - over * over * 8.0 - over * 5.0
@@ -685,14 +692,21 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             -- flightTime уже рассчитан CalcLaunchDir
             local flightTime = flightT
             -- Пик дуги: момент когда vy - g*t = 0
-            local vyComp  = launchDir.Y * speed
-            local tPeak   = math.max(vyComp / GRAVITY, 0)
-            local peakFrac = (flightTime > 1e-4) and math.clamp(tPeak / flightTime, 0.15, 0.80) or 0.40
-            local peakPos = startPos + Vector3.new(
-                launchDir.X * speed * tPeak,
-                launchDir.Y * speed * tPeak - 0.5 * GRAVITY * tPeak * tPeak,
-                launchDir.Z * speed * tPeak
+            -- Визуальный midPos: сэмплируем физическую позицию мяча при t=0.40*flightTime.
+            -- • Гарантированно между startPos и idealPos → Безье не деградирует.
+            -- • Горизонтальное смещение учитывает drag (hFactor).
+            -- • Боковое смещение (спин/деривация) отражено автоматически через launchDir.
+            -- • Высота даёт видимую дугу: мяч выше прямой линии start→idealPos.
+            local t40     = 0.40 * flightTime
+            local hF40    = (AutoShootDragComp > 1e-5)
+                            and ((1 - math.exp(-AutoShootDragComp * t40)) / AutoShootDragComp)
+                            or t40
+            local peakPos = Vector3.new(
+                startPos.X + launchDir.X * speed * hF40,
+                startPos.Y + launchDir.Y * speed * t40 - 0.5 * GRAVITY * t40 * t40,
+                startPos.Z + launchDir.Z * speed * hF40
             )
+            local peakFrac = 0.40
             table.insert(candidates, {
                 idealPos    = idealPos,
                 aimPoint    = aimPoint,
