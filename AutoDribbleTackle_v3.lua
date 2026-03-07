@@ -1,6 +1,5 @@
 -- [v3.1] AUTO DRIBBLE + AUTO TACKLE
 local Players = game:GetService("Players")
-print('7')
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -8,7 +7,7 @@ local Camera = Workspace.CurrentCamera
 local UserInputService = game:GetService("UserInputService")
 local Debris = game:GetService("Debris")
 local Stats = game:GetService("Stats")
-
+print('9')
 local LocalPlayer = Players.LocalPlayer
 local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
 local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
@@ -62,7 +61,7 @@ local AutoDribbleConfig = {
     Enabled = false,
     MaxDribbleDistance = 30,
     DribbleActivationDistance = 16,
-    MinAngleForDribble = 36,      -- Минимальный угол атаки такля в нас (чем меньше — строже)
+    MinAngleForDribble = 30,      -- Минимальный угол атаки такля в нас (чем меньше — строже)
     HeadOnAngleThreshold = 45,    -- Угол для "head-on" детекции
 }
 
@@ -225,7 +224,7 @@ end
 -- Обновляет PredictionLabel каждый кадр для текущего owner.
 -- Вызывается из основного Heartbeat-цикла, НЕ только при такле.
 local function UpdatePredictionLabel(ownerRoot, player)
-    if not Gui or not AutoTackleConfig.Enabled then return end
+    if not Gui or not DebugConfig.Enabled or not AutoTackleConfig.Enabled then return end
     if not ownerRoot or not player then
         Gui.PredictionLabel.Text = "Pred: no target"
         return
@@ -233,15 +232,19 @@ local function UpdatePredictionLabel(ownerRoot, player)
     local ping    = AutoTackleStatus.Ping
     local vel     = GetPositionBasedVelocity(player)
     local flatVel = Vector3.new(vel.X, 0, vel.Z)
-    local serverPos = ownerRoot.Position + flatVel * ping
-    local myPos2D  = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
-    local target2D = Vector3.new(serverPos.X, 0, serverPos.Z)
+    local serverPos  = ownerRoot.Position + flatVel * ping
+    local myPos2D    = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
+    local target2D   = Vector3.new(serverPos.X, 0, serverPos.Z)
+    -- Дистанция от нас до серверной позиции цели
+    local dist       = (target2D - myPos2D).Magnitude
     local interceptT = CalcInterceptTime(myPos2D, target2D, flatVel, AutoTackleConfig.TackleSpeed)
+    -- Показываем: пинг | intercept time | скорость цели | дистанция
     Gui.PredictionLabel.Text = string.format(
-        "Pred: p=%.0f t=%.0f v=%.1f",
-        ping * 1000,
-        interceptT * 1000,
-        flatVel.Magnitude
+        "p=%dms t=%dms v=%.0f d=%.0f",
+        math.round(ping * 1000),
+        math.round(interceptT * 1000),
+        flatVel.Magnitude,
+        dist
     )
 end
 
@@ -735,10 +738,13 @@ local function PerformTackle(ball, owner)
     -- Ротируемся к предикт-позиции
     RotateToTarget(predictedPos)
 
-    -- firetouchinterest нашего HRP к вражескому HRP для регистрации контакта на сервере
+    -- firetouchinterest только если враг близко (<=10 studs) и скрипт активно таклит
     if ownerRoot then
-        pcall(function() firetouchinterest(HumanoidRootPart, ownerRoot, 0) end)
-        pcall(function() firetouchinterest(HumanoidRootPart, ownerRoot, 1) end)
+        local ftiDist = (HumanoidRootPart.Position - ownerRoot.Position).Magnitude
+        if ftiDist <= 10 then
+            pcall(function() firetouchinterest(HumanoidRootPart, ownerRoot, 0) end)
+            pcall(function() firetouchinterest(HumanoidRootPart, ownerRoot, 1) end)
+        end
     end
 
     pcall(function() ActionRemote:FireServer("TackIe") end)
@@ -1014,7 +1020,7 @@ local function ShouldDribbleNow(specificTarget, tacklerData)
     if not specificTarget or not tacklerData then return false end
     local currentTime = tick()
     -- Антиспам
-    if currentTime - AutoDribbleStatus.TackleDetectionCooldown < 0.35 then return false end
+    if currentTime - AutoDribbleStatus.TackleDetectionCooldown < 0.2 then return false end
 
     local tacklerRoot = tacklerData.RootPart
     if not tacklerRoot then return false end
@@ -1097,32 +1103,48 @@ AutoDribble.Start = function()
 
     if not Gui then SetupGUI() end
 
-    AutoDribbleStatus.Connection = RunService.RenderStepped:Connect(function()
+    -- Heartbeat приоритетнее RenderStepped для логики — меньше задержка реакции
+    AutoDribbleStatus.Connection = RunService.Heartbeat:Connect(function()
         if not AutoDribbleConfig.Enabled then CleanupDebugText(); UpdateDebugVisibility(); return end
-        pcall(function()
-            local specificTarget, minDist, targetCount, nearestTacklerData = nil, math.huge, 0, nil
-            for player, data in pairs(PrecomputedPlayers) do
-                if data.IsValid and TackleStates[player] and TackleStates[player].IsTackling then
-                    targetCount += 1
-                    if data.Distance < minDist then
-                        minDist = data.Distance; specificTarget = player; nearestTacklerData = data
-                    end
+
+        -- Быстрый путь без pcall-overhead: сначала проверяем нужные условия
+        if not HasBall or not CanDribbleNow then
+            if Gui then Gui.AutoDribbleLabel.Text = "AutoDribble: Idle" end
+            return
+        end
+
+        -- Ищем ближайшего активного таклера прямо из PrecomputedPlayers
+        -- (уже обновлено в HeartbeatConnection этого же кадра)
+        local specificTarget, minDist, targetCount, nearestTacklerData = nil, math.huge, 0, nil
+        for player, data in pairs(PrecomputedPlayers) do
+            if data.IsValid and TackleStates[player] and TackleStates[player].IsTackling then
+                targetCount += 1
+                if data.Distance < minDist then
+                    minDist = data.Distance
+                    specificTarget = player
+                    nearestTacklerData = data
                 end
             end
-            if Gui then
-                Gui.DribbleTargetLabel.Text = "Targets: " .. targetCount
-                Gui.DribbleTacklingLabel.Text = specificTarget and string.format("Tackle: %.1f", minDist) or "Tackle: None"
-            end
-            if HasBall and CanDribbleNow and specificTarget and nearestTacklerData then
-                if ShouldDribbleNow(specificTarget, nearestTacklerData) then
-                    PerformDribble()
-                else
-                    if Gui then Gui.AutoDribbleLabel.Text = "AutoDribble: Waiting" end
-                end
-            else
-                if Gui then Gui.AutoDribbleLabel.Text = "AutoDribble: Idle" end
-            end
-        end)
+        end
+
+        if Gui then
+            Gui.DribbleTargetLabel.Text  = "Targets: " .. targetCount
+            Gui.DribbleTacklingLabel.Text = specificTarget
+                and string.format("Tackle: %.1f", minDist)
+                or "Tackle: None"
+        end
+
+        if not specificTarget or not nearestTacklerData then
+            if Gui then Gui.AutoDribbleLabel.Text = "AutoDribble: Idle" end
+            return
+        end
+
+        -- Основная проверка
+        if ShouldDribbleNow(specificTarget, nearestTacklerData) then
+            PerformDribble()
+        else
+            if Gui then Gui.AutoDribbleLabel.Text = "AutoDribble: Waiting" end
+        end
     end)
 
     UpdateDebugVisibility()
