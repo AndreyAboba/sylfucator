@@ -41,13 +41,14 @@ local AutoShootSpoofPowerEnabled = false
 local AutoShootSpoofPowerType    = "math.huge"
 -- Физика
 local GRAVITY              = 196.2   -- studs/s² (Roblox workspace gravity)
-local AutoShootBallSpeed   = 380     -- Скорость мяча studs/s. Мяч выше цели → увеличь. Мяч ниже → уменьши.
-local AutoShootDragComp    = 0.10    -- Компенсация трения (studs / stud дистанции × 0.01). Мяч не долетает → увеличь.
+local AutoShootBallSpeed   = 600     -- Скорость мяча studs/s. Мяч выше цели → увеличь. Мяч ниже → уменьши.
+local AutoShootDragComp    = 0.5     -- k (1/s): экспоненц. затухание v_h=V·e^(-k·t). Не долетает → увеличь. Летит выше → уменьши.
 local FIXED_POWER          = 5.0
 local GK_REACH_RADIUS      = 5.0    -- Радиус статичного покрытия GK (studs)
 local GK_REACH_SPEED       = 12.0   -- Скорость реакции GK для предикта дайва (studs/s)
 local SPIN_TRICK_DIST      = 72     -- Ниже этой дистанции спин/навесы не работают на сервере
 local SPIN_TRICK_MULT      = 2.8    -- ShootVel множитель для обмана дистанции
+local AutoShootDerivMult   = 4.5    -- studs деривации при d=100. Мяч улетает меньше → увеличь.
 local BALL_RADIUS           = 1.168  -- радиус мяча: 2.336 / 2 studs
 -- Безопасный отступ = радиус мяча + небольшой запас чтобы мяч не касался штанги
 local INSET                = BALL_RADIUS + 0.35  -- ~1.52 studs
@@ -141,7 +142,7 @@ local function DrawTrajectory(startPos, launchDir, flightTime)
     local vx0 = launchDir.X * V
     local vy0 = launchDir.Y * V
     local vz0 = launchDir.Z * V
-    local k   = AutoShootDragComp * 0.1  -- коэффициент затухания
+    local k   = AutoShootDragComp        -- 1/s, та же модель что в CalcLaunchDir
 
     -- Вычисляем позицию в момент t с учётом drag
     local function BallPos(t)
@@ -419,30 +420,23 @@ local function CalcLaunchDir(startPos, targetPos)
         return Vector3.new(0, 1, 0), 0, 0.1
     end
 
-    local V = AutoShootBallSpeed
-    -- Приблизительное время полёта (горизонтальная скорость ≈ V)
-    local t = horizDist / V
-
-    -- Поправка гравитации: за t секунд мяч опустится на Δy_g
-    local gravComp = 0.5 * GRAVITY * t * t
-
-    -- Поправка трения: линейно растёт с дистанцией
-    -- AutoShootDragComp — studs дополнительной высоты на каждые 10 studs дистанции
-    local dragComp = AutoShootDragComp * horizDist * 0.1
-    if horizDist > 80 then
-        dragComp = dragComp + AutoShootDragComp * ((horizDist - 80) / 80)^2 * 4.0
+    local V  = AutoShootBallSpeed
+    local k  = AutoShootDragComp   -- 1/s, экспоненциальная модель v_h(t)=V·exp(-k·t)
+    -- Горизонтальная дистанция: d = (V/k)·(1-exp(-k·t))  =>  t = -ln(1 - k·d/V) / k
+    -- При k→0: t = d/V.  Непрерывная функция, нет if-костылей.
+    local t
+    if k < 1e-5 then
+        t = horizDist / V
+    else
+        local kd = math.min(k * horizDist / V, 0.990)
+        t = -math.log(1 - kd) / k
     end
 
-    -- Поднимаем целевую точку на обе поправки
-    local corrY = targetPos.Y + gravComp + dragComp
-
-    -- Вектор до скорректированной точки
-    local corrected = Vector3.new(targetPos.X, corrY, targetPos.Z)
-    local dir       = (corrected - startPos).Unit
-
-    -- Реальное время полёта с учётом косинуса угла
-    local cosAngle  = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
-    local realT     = (cosAngle > 0.01) and (horizDist / (V * cosAngle)) or t
+    local gravComp = 0.5 * GRAVITY * t * t
+    local corrY    = targetPos.Y + gravComp
+    local dir      = (Vector3.new(targetPos.X, corrY, targetPos.Z) - startPos).Unit
+    local cosAngle = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
+    local realT    = t  -- drag уже в t (flight time с затуханием)
 
     return dir, horizDist, realT
 end
@@ -526,6 +520,18 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
                 if gkVel.Unit:Dot(toT) > 0.65 then score = score - 4.5 end
             end
 
+            -- Тень тела GK: проекция на плоскость ворот.
+            -- Если candidate попадает в силуэт GK → сильный штраф (удар блокируется телом).
+            if gkHrp then
+                local gkProj = GoalCFrame:PointToObjectSpace(gkHrp.Position)
+                local gkBX   = gkProj.X
+                local gkBY   = gkHrp.Position.Y - (GoalFloorY or GoalCFrame.Position.Y)
+                local inShadow = math.abs(localX - gkBX) < 1.3
+                             and localY > (gkBY - 1.5)
+                             and localY < (gkBY + 2.5)
+                if inShadow then score = score - 14.0 end
+            end
+
             -- Power не влияет на траекторию → константа
             local power = FIXED_POWER
             local speed = AutoShootBallSpeed
@@ -545,11 +551,11 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
                 end
             end
 
-            -- Деривация спина (горизонтальный сдвиг прицела)
+            -- Деривация спина: физически ∝ t² ∝ (d/V)².  AutoShootDerivMult задаёт масштаб.
             local derivation = 0
             if spinDir ~= "None" then
-                local dMult  = math.clamp((dist / 100)^1.5 * 1.2, 0.3, 4.0)
-                derivation   = (spinDir == "Left" and 1 or -1) * dMult * power
+                local dMult  = AutoShootDerivMult * (dist / 100)^2
+                derivation   = (spinDir == "Left" and 1 or -1) * dMult
             end
 
             -- shootPos = с учётом деривации (реальная точка куда направляем мяч)
@@ -663,25 +669,34 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
                 local goesIn = (dOutLocalZ < 0.1) and not badAngle
 
                 if goesIn then
-                    -- Примерная точка приземления: двигаемся вглубь ворот на 5 studs
-                    local landWorld  = hitWorld + dOut * 5
-                    local landLocal  = GoalCFrame:PointToObjectSpace(landWorld)
+                    -- Трейс dOut до задней сетки ворот (Z_local = -NET_DEPTH)
+                    local NET_DEPTH  = 5
+                    local dOutLoc    = GoalCFrame:VectorToObjectSpace(dOut)
+                    local hitLoc     = GoalCFrame:PointToObjectSpace(hitWorld)
+                    local tNet       = (dOutLoc.Z < -0.01)
+                                        and ((-NET_DEPTH - hitLoc.Z) / dOutLoc.Z)
+                                        or  5
+                    local landLocal  = hitLoc + dOutLoc * tNet
                     local landX      = landLocal.X
                     local landY      = landLocal.Y
 
                     -- Scoring: как далеко от вратаря место приземления?
-                    local rgkDistX  = math.abs(gkX - landX)
-                    local rgkDistY  = math.abs(gkY - landY)
-                    local rgkDist   = math.sqrt(rgkDistX*rgkDistX + rgkDistY*rgkDistY)
-                    local rscore    = rgkDist * 2.5
+                    -- Predicted GK scoring для рикошета
+                    local rpgkDistX = math.abs(pgkX - landX)
+                    local rpgkDistY = math.abs(pgkY - landY)
+                    local rpgkDist  = math.sqrt(rpgkDistX*rpgkDistX + rpgkDistY*rpgkDistY)
+                    local rReach    = math.clamp(1 - rpgkDist / diveRange, 0, 1)
+                    local rscore    = rpgkDist * 3.0 - rReach * 8.0
 
-                    -- Бонус если рикошет перебрасывает мяч на противоположную сторону от GK
-                    local crossSide = (gkX > 0 and landX < -GoalWidth*0.15)
-                                   or (gkX < 0 and landX >  GoalWidth*0.15)
-                    if crossSide then rscore = rscore + 5.0 end
+                    -- Мяч после рикошета летит на противоположную сторону от GK
+                    local crossSide = (pgkX > 0 and landX < -GoalWidth*0.20)
+                                   or (pgkX < 0 and landX >  GoalWidth*0.20)
+                    if crossSide then rscore = rscore + 7.0 end
 
-                    -- Лёгкий штраф за сложность попадания в точку рикошета
-                    rscore = rscore - 1.5
+                    -- Бонус за угол рикошета близкий к 45° (идеальный отскок)
+                    rscore = rscore + (30 - math.abs(incDeg - 45)) * 0.1
+
+                    rscore = rscore - 1.0  -- базовый штраф за сложность
 
                     -- LaunchDir на точку касания (с гравитационной коррекцией)
                     local rLaunchDir, rHorizD, rFlightT = CalcLaunchDir(startPos, hitWorld)
@@ -798,8 +813,8 @@ local function CalculateTarget()
                             launchAngle, result.flightTime,
                             result.trajOk and "OK" or "!steep",
                             result.spin)
-        Gui.Spin.Text   = string.format("V=%.0f drag=%.2f dist=%.0f gk=%.1f",
-                            AutoShootBallSpeed, AutoShootDragComp, dist, result.gkDist)
+        Gui.Spin.Text   = string.format("V=%.0f k=%.2f drv=%.1f d=%.0f",
+                            AutoShootBallSpeed, AutoShootDragComp, AutoShootDerivMult, dist)
         Gui.Goal.Text   = string.format("Goal W=%.1f H=%.1f floor=%.1f", GoalWidth, GoalHeight, GoalFloorY)
     end
 end
