@@ -34,7 +34,8 @@ local function GetPing()
         local ping = tonumber(pingStr:match("%d+"))
         return ping or 0
     end)
-    if success and pingValue then return pingValue / 1000 end
+    -- pingValue=0 тоже truthy в Lua, но 0ms пинг нереален — используем fallback
+    if success and pingValue and pingValue > 0 then return pingValue / 1000 end
     return 0.1
 end
 
@@ -133,7 +134,7 @@ local SPECIFIC_TACKLE_ID = "rbxassetid://14317040670"
 --      и уже от этой «реальной» позиции считаем перехват.
 -- =============================================================
 local HISTORY_SIZE   = 8
-local HISTORY_WINDOW = 0.12 -- секунды
+local HISTORY_WINDOW = 0.20 -- секунды
 
 local function RecordTargetPosition(ownerRoot, player)
     local history = AutoTackleStatus.TargetPositionHistory[player]
@@ -164,6 +165,22 @@ local function GetPositionBasedVelocity(player)
     local dt = newest.time - oldest.time
     if dt < 0.001 then return Vector3.zero end
     return (newest.pos - oldest.pos) / dt
+end
+
+-- Вызывается каждый Heartbeat — накапливает историю позиций владельца мяча.
+-- Без этого RecordTargetPosition вызывался только в момент такла,
+-- и история всегда была пустой → velocity = 0 → Pred = 0ms.
+local function UpdateBallOwnerHistory()
+    local ball = Workspace:FindFirstChild("ball")
+    if not ball then return end
+    local creatorRef = ball:FindFirstChild("creator")
+    if not creatorRef or not creatorRef.Value then return end
+    local owner = creatorRef.Value
+    if owner == LocalPlayer then return end
+    if not owner.Character then return end
+    local ownerRoot = owner.Character:FindFirstChild("HumanoidRootPart")
+    if not ownerRoot then return end
+    RecordTargetPosition(ownerRoot, owner)
 end
 
 local function PredictTargetPosition(ownerRoot, player)
@@ -235,10 +252,10 @@ local function PredictTargetPosition(ownerRoot, player)
 
     if Gui and AutoTackleConfig.Enabled then
         Gui.PredictionLabel.Text = string.format(
-            "Pred: %.0fms | v=%.1f | t=%.0fms",
+            "Pred: %.0fms | ping: %.0fms | v=%.1f",
+            interceptTime * 1000,
             ping * 1000,
-            flatVel.Magnitude,
-            interceptTime * 1000
+            flatVel.Magnitude
         )
     end
 
@@ -974,6 +991,7 @@ AutoTackle.Start = function()
 
     AutoTackleStatus.HeartbeatConnection = RunService.Heartbeat:Connect(function()
         pcall(UpdatePing)
+        pcall(UpdateBallOwnerHistory)
         pcall(UpdateDribbleStates)
         pcall(PrecomputePlayers)
         pcall(UpdateTargetCircles)
@@ -1526,6 +1544,7 @@ function AutoDribbleTackleModule.Init(UI, coreParam, notifyFunc)
         DribbleStates = {}; TackleStates = {}; PrecomputedPlayers = {}
         DribbleCooldownList = {}; EagleEyeTimers = {}
         AutoTackleStatus.TargetPositionHistory = {}
+        DribblePositionHistory = {}
         AutoTackleStatus.TargetCircles = {}
         DribblePositionHistory = {}
         CurrentTargetOwner = nil
