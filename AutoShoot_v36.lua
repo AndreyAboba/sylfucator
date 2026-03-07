@@ -133,29 +133,44 @@ local function InitializeCubes()
     SC(PeakCube,   Color3.fromRGB(255,255,0), 4)   -- 🟡 жёлтый = пик дуги
 end
 
--- DrawTrajectory: Quadratic Bezier через 3 опорные точки (start → peak → land).
--- Этот метод ГАРАНТИРОВАННО рисует ровно от мяча до целевой точки,
--- полностью избегая ошибок интегрирования физики.
--- startPos = где мяч сейчас, peakPos = пик дуги, endPos = куда прилетит (красный куб).
-local function DrawTrajectory(startPos, peakPos, endPos)
+-- DrawTrajectory: кубический Безье с боковым смещением для Магнус-эффекта.
+-- P0=start, P3=land (красный куб), P1/P2 = управляющие точки для подъёма + Magnus curl.
+-- spinStr: "Left" = мяч летит вправо, "Right" = мяч летит влево (инверсия в игре).
+local function DrawTrajectory(startPos, peakPos, endPos, spinStr)
     if not peakPos or not endPos then
         for _, l in ipairs(TrajectoryLines) do l.Visible = false end; return
     end
 
-    -- Параметрический Bezier: B(t) = (1-t)²·P0 + 2t(1-t)·Pc + t²·P2
-    -- Pc = контрольная точка. Чтобы парабола ПРОХОДИЛА через peakPos при t=0.5:
-    -- peakPos = 0.25*start + 0.5*Pc + 0.25*end  =>  Pc = 2*peakPos - 0.5*(start+end)
-    local Pc = peakPos * 2 - (startPos + endPos) * 0.5
+    -- Боковой вектор (перпендикуляр к траектории в горизонтальной плоскости)
+    local fwd = endPos - startPos
+    fwd = Vector3.new(fwd.X, 0, fwd.Z)
+    if fwd.Magnitude < 0.1 then fwd = Vector3.new(1,0,0) end
+    fwd = fwd.Unit
+    local right = Vector3.new(-fwd.Z, 0, fwd.X)  -- поворот на 90° вправо
+
+    -- Боковое смещение на пике: "Right" = влево, "Left" = вправо (инверсия игры)
+    local spinSign = (spinStr == "Right") and -1 or (spinStr == "Left") and 1 or 0
+    -- peakPos уже смещён из-за деривации — дополнительно акцентируем боковую кривизну
+    local peakLateral = peakPos + right * spinSign * 1.2
+
+    -- Кубический Безье: start → (P1) → (P2=peakLateral) → end
+    local P0 = startPos
+    local P1 = Vector3.new(startPos.X + (peakLateral.X-startPos.X)*0.5,
+                           startPos.Y + (peakLateral.Y-startPos.Y)*0.8,
+                           startPos.Z + (peakLateral.Z-startPos.Z)*0.5)
+    local P2 = peakLateral
+    local P3 = endPos
+
+    local function cubicBezier(t)
+        local mt = 1 - t
+        return P0*(mt*mt*mt) + P1*(3*mt*mt*t) + P2*(3*mt*t*t) + P3*(t*t*t)
+    end
 
     for i = 1, TRAJ_SEGMENTS do
         local t0 = (i-1) / TRAJ_SEGMENTS
         local t1 = i     / TRAJ_SEGMENTS
-        local function bezier(t)
-            local mt = 1 - t
-            return startPos * (mt*mt) + Pc * (2*mt*t) + endPos * (t*t)
-        end
-        local p0 = bezier(t0)
-        local p1 = bezier(t1)
+        local p0 = cubicBezier(t0)
+        local p1 = cubicBezier(t1)
         local s0, v0 = Camera:WorldToViewportPoint(p0)
         local s1, v1 = Camera:WorldToViewportPoint(p1)
         local l = TrajectoryLines[i]
@@ -549,24 +564,29 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
 
             -- Решение о спине
             local spinDir = "None"
+            -- ВАЖНО: в игре спин инвертирован относительно интуиции:
+            --   "Right" label → мяч летит ВЛЕВО (Магнус)
+            --   "Left"  label → мяч летит ВПРАВО
+            -- Поэтому: GK справа → хотим огнуть ВЛЕВО → шлём "Right" на сервер
             if dist > 65 and gkDist2D < 5.5 then
-                -- GK близко к цели → спин огибает его
-                spinDir = (gkX > localX) and "Left" or "Right"
+                spinDir = (gkX > localX) and "Right" or "Left"
                 score   = score + 2.0
             elseif dist > 105 then
-                local goalDir    = (GoalCFrame.Position - startPos).Unit
-                local fwdDir     = HumanoidRootPart.CFrame.LookVector
-                local fwdAngle   = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
+                local goalDir  = (GoalCFrame.Position - startPos).Unit
+                local fwdDir   = HumanoidRootPart.CFrame.LookVector
+                local fwdAngle = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
                 if fwdAngle < 20 then
-                    spinDir = localX >= 0 and "Right" or "Left"
+                    -- "Right" огибает влево → для цели слева используем "Right" чтобы закрутить туда
+                    spinDir = localX >= 0 and "Left" or "Right"
                 end
             end
 
-            -- Деривация спина: физически ∝ t² ∝ (d/V)².  AutoShootDerivMult задаёт масштаб.
+            -- Деривация: "Right" огибает ВЛЕВО → целимся ПРАВЕЕ цели (+dMult)
+            --            "Left"  огибает ВПРАВО → целимся ЛЕВЕЕ  (-dMult)
             local derivation = 0
             if spinDir ~= "None" then
                 local dMult  = AutoShootDerivMult * (dist / 100)^2
-                derivation   = (spinDir == "Left" and 1 or -1) * dMult
+                derivation   = (spinDir == "Right" and 1 or -1) * dMult
             end
 
             -- shootPos = с учётом деривации (реальная точка куда направляем мяч)
@@ -600,6 +620,16 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
                 )
             else
                 aimPoint = shootPos
+            end
+
+            -- ШТРАФ если прицел (aimPoint) уходит выше перекладины ворот.
+            -- На ближних дистанциях гравитационная поправка поднимает прицел,
+            -- и верхние цели становятся физически недостижимы без перелёта.
+            local crossbarWorldY = GoalFloorY + GoalHeight
+            if aimPoint.Y > crossbarWorldY + 0.1 then
+                -- Пропорциональный штраф: чем выше прицел над перекладиной, тем хуже
+                local over = aimPoint.Y - crossbarWorldY
+                score = score - over * 7.0
             end
 
             -- flightTime уже рассчитан CalcLaunchDir
@@ -988,7 +1018,7 @@ AutoShoot.Start = function()
 
         -- 🟠 Траектория дуги (оранжевые линии) — главный визуал
         if hasTarget and CurrentLaunchDir and CurrentFlightTime > 0 then
-            DrawTrajectory(GetBallStartPos(), CurrentPeakPos, PredictedLand)
+            DrawTrajectory(GetBallStartPos(), CurrentPeakPos, PredictedLand, CurrentSpin)
         else
             for _, l in ipairs(TrajectoryLines) do l.Visible = false end
         end
