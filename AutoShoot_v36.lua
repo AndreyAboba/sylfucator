@@ -40,9 +40,9 @@ local AutoShootButtonScale  = 1.0
 local AutoShootSpoofPowerEnabled = false
 local AutoShootSpoofPowerType    = "math.huge"
 -- Физика
-local GRAVITY         = 196.2  -- studs/s² (Roblox workspace default)
-local BALL_SPEED      = 200    -- studs/s — базовая скорость мяча (power=1 → ~200 studs/s)
-local INSET           = 1.5    -- отступ от штанг внутрь (studs)
+local GRAVITY              = 196.2  -- studs/s² (Roblox workspace gravity
+local AutoShootBallSpeed   = 170    -- studs/s на единицу power; калибруй слайдером
+local INSET                = 1.5    -- отступ от штанг внутрь (studs)
 
 -- ============================================================
 -- STATUS
@@ -135,13 +135,13 @@ end
 -- ОПРЕДЕЛЕНИЕ ВОРОТ — полностью автоматически по реальным позициям стоек
 -- Не используем никаких Y-offset — берём реальные координаты из мира
 -- ============================================================
-local GoalCFrame, GoalWidth, GoalHeight, GoalCrossbarY
+local GoalCFrame, GoalWidth, GoalHeight, GoalFloorY
 local function UpdateGoal()
     local myTeam, enemyGoalName = (function()
         local stats = Workspace:FindFirstChild("PlayerStats")
         if not stats then return nil, nil end
-        if stats:FindFirstChild("Away") and stats.Away:FindFirstChild(LocalPlayer.Name) then return "Away", "HomeGoal"
-        elseif stats:FindFirstChild("Home") and stats.Home:FindFirstChild(LocalPlayer.Name) then return "Home", "AwayGoal" end
+        if stats:FindFirstChild("Away") and stats.Away:FindFirstChild(LocalPlayer.Name) then return "Away","HomeGoal"
+        elseif stats:FindFirstChild("Home") and stats.Home:FindFirstChild(LocalPlayer.Name) then return "Home","AwayGoal" end
         return nil, nil
     end)()
     if not enemyGoalName then return nil end
@@ -151,59 +151,63 @@ local function UpdateGoal()
     local frame = goalFolder:FindFirstChild("Frame")
     if not frame then return nil end
 
-    -- Ищем стойки и перекладину
     local posts, crossbar = {}, nil
     for _, part in ipairs(frame:GetChildren()) do
         if part:IsA("BasePart") then
             if part.Name == "Crossbar" then
                 crossbar = part
             else
-                local hasCylinder, hasSound = false, false
+                local hasCyl, hasSnd = false, false
                 for _, c in ipairs(part:GetChildren()) do
-                    if c:IsA("CylinderMesh") then hasCylinder = true end
-                    if c:IsA("Sound") then hasSound = true end
+                    if c:IsA("CylinderMesh") then hasCyl = true end
+                    if c:IsA("Sound")        then hasSnd = true end
                 end
-                if hasCylinder and hasSound then table.insert(posts, part) end
+                if hasCyl and hasSnd then table.insert(posts, part) end
             end
         end
     end
-
     if #posts < 2 then
-        -- Fallback: просто левый/правый по X
         for _, part in ipairs(frame:GetChildren()) do
-            if part:IsA("BasePart") and part.Name ~= "Crossbar" then
-                table.insert(posts, part)
-            end
+            if part:IsA("BasePart") and part.Name ~= "Crossbar" then table.insert(posts, part) end
         end
     end
     if #posts < 2 or not crossbar then return nil end
 
-    -- Сортируем по X → leftPost, rightPost
     table.sort(posts, function(a,b) return a.Position.X < b.Position.X end)
     local leftPost, rightPost = posts[1], posts[#posts]
 
-    -- Центр ворот — между стойками на уровне земли
-    -- Горизонтальный центр
-    local centerPos = (leftPost.Position + rightPost.Position) / 2
+    -- Пол ворот = нижний торец стоек (центр поста - полувысота)
+    -- Стойки — вертикальные цилиндры, Size.Y = их высота
+    local lFloor = leftPost.Position.Y  - leftPost.Size.Y  / 2
+    local rFloor = rightPost.Position.Y - rightPost.Size.Y / 2
+    local floorY = math.min(lFloor, rFloor)
 
-    -- Ширина — реальное расстояние между стойками (внутренний просвет)
-    local width  = (leftPost.Position - rightPost.Position).Magnitude
-    -- Высота — от нижней точки стоек до перекладины (реальная высота)
-    local postBaseY  = math.min(leftPost.Position.Y, rightPost.Position.Y)
-    local crossbarY  = crossbar.Position.Y
-    local height = math.abs(crossbarY - postBaseY)
+    -- Верхняя граница = нижний торец перекладины
+    -- Перекладина — горизонтальный цилиндр, Size.Y = его длина вдоль оси, Size.X/Z = диаметр
+    -- Реальный радиус перекладины: min(Size.X, Size.Z) / 2
+    local crossbarRadius = math.min(crossbar.Size.X, crossbar.Size.Z) / 2
+    local topY = crossbar.Position.Y - crossbarRadius
 
-    -- CFrame ворот: центр у основания, ось X → правая стойка, ось Y → вверх
+    -- Внутренняя ширина (между внутренними гранями стоек)
+    local postRadiusL = math.min(leftPost.Size.X, leftPost.Size.Z) / 2
+    local postRadiusR = math.min(rightPost.Size.X, rightPost.Size.Z) / 2
+    local width = (leftPost.Position - rightPost.Position).Magnitude - postRadiusL - postRadiusR
+
+    local height = math.abs(topY - floorY)
+
+    -- CFrame: начало координат = центр пола ворот, X = вправо, Y = вверх
     local rightDir = (rightPost.Position - leftPost.Position).Unit
     local upDir    = Vector3.new(0, 1, 0)
-    local fwdDir   = rightDir:Cross(upDir).Unit  -- нормаль ворот
-
-    -- Центр для CFrame — середина нижней стороны ворот
-    GoalCFrame   = CFrame.fromMatrix(centerPos, rightDir, upDir, -fwdDir)
-    GoalWidth    = width
-    GoalHeight   = height
-    GoalCrossbarY = crossbarY
-
+    local fwdDir   = rightDir:Cross(upDir).Unit
+    local floorCenter = Vector3.new(
+        (leftPost.Position.X + rightPost.Position.X) / 2,
+        floorY,
+        (leftPost.Position.Z + rightPost.Position.Z) / 2
+    )
+    GoalCFrame  = CFrame.fromMatrix(floorCenter, rightDir, upDir, -fwdDir)
+    GoalWidth   = width
+    GoalHeight  = height
+    GoalFloorY  = floorY
     return width
 end
 
@@ -283,50 +287,66 @@ local function GetEnemyGoalie()
 end
 
 -- ============================================================
--- ЯДРО: SMART TARGET SELECTION
--- Логика:
---   1. Разбиваем ворота на сетку кандидатных точек (X × Y)
---   2. Для каждой точки считаем score = расстояние до вратаря - штрафы
---   3. Автоматически решаем: нужен спин или нет
---   4. Спин помогает когда вратарь близко к цели — мяч "объезжает"
---   5. Power рассчитывается по физике: t = dist/speed, h = v_y*t - 0.5*g*t²
---      откуда v_y = (h + 0.5*g*t²) / t, power ≈ speed / BALL_SPEED
+-- ЯДРО: БАЛЛИСТИКА + SMART TARGET SELECTION
+-- CalcLaunchDir: решает обратную задачу траектории.
+-- Нам нужно попасть в точку targetPos стартуя из startPos.
+-- Мяч летит под углом θ с начальной скоростью v.
+-- По горизонтали: dist = v*cos(θ)*t  →  t = dist/(v*cos(θ))
+-- По вертикали:   dh   = v*sin(θ)*t - 0.5*g*t²
+-- Подстановка t и u=tan(θ):
+--   k*u² - dist*u + (dh+k) = 0  где k = g*dist²/(2*v²)
+-- Берём низкоугольное решение (более прямой удар).
 -- ============================================================
 local TargetPoint, ShootDir, ShootVel, CurrentSpin, CurrentPower, CurrentType
-local LastShootRedBox = nil   -- точка куда ХОТЕЛИ ударить (красный бокс)
+local AimPoint        = nil  -- зелёный бокс: куда направлен ShootDir
+local PredictedLand   = nil  -- красный бокс:  где мяч приземлится (=idealPos)
 local LastShoot = 0
 local CanShoot  = true
 
-local function CalcPowerAndHeight(dist, targetLocalY)
-    -- targetLocalY: желаемая высота точки ударения НАД ПОЛОМ ворот (studs)
-    -- v_y нужна чтобы мяч прилетел на нужную высоту
-    -- t = dist / (power * BALL_SPEED)  →  итерируем по power
-    -- Используем физику: h_arrival = startH + v_y*t - 0.5*g*t²
-    -- startH ≈ 3 (высота мяча у игрока)
-    local startH = 3.0
-    local goalH  = targetLocalY  -- желаемая высота прилёта над полом ворот
-    -- Дельта высоты
-    local dh = goalH - startH
+-- startPos: откуда бьём (HRP), targetPos: куда хотим попасть, speed: studs/s
+-- Возвращает: launchDir (unit), success
+local function CalcLaunchDir(startPos, targetPos, speed)
+    local toTarget = targetPos - startPos
+    local horiz    = Vector3.new(toTarget.X, 0, toTarget.Z)
+    local dist     = horiz.Magnitude
+    local dh       = toTarget.Y  -- разница высот
 
-    -- Power диапазон
-    for _, power in ipairs({3.5, 4.0, 4.5, 5.0, 3.0, 2.5, 6.0, 7.0}) do
-        local speed = power * BALL_SPEED
-        local t = dist / speed
-        if t > 0.05 and t < 3.0 then
-            -- Нужная начальная вертикальная скорость
-            local vy = (dh + 0.5 * GRAVITY * t * t) / t
-            -- Максимальная высота: vy²/(2g)
-            local maxH = startH + (vy * vy) / (2 * GRAVITY)
-            if maxH < 200 and vy > 0 then
-                return power, vy, t
-            end
-        end
+    if dist < 0.5 then return Vector3.new(0, 1, 0), true end
+
+    local v2   = speed * speed
+    local k    = (GRAVITY * dist * dist) / (2 * v2)
+    -- k*u² - dist*u + (dh+k) = 0
+    local A    = k
+    local B    = -dist
+    local C    = dh + k
+    local disc = B*B - 4*A*C
+
+    local tanTheta
+    if disc < 0 then
+        -- Не достать при данной скорости — целимся под 45°
+        tanTheta = 1.0
+    else
+        local sqD = math.sqrt(disc)
+        local t1  = (-B - sqD) / (2*A)  -- низкий угол (прямой удар)
+        local t2  = (-B + sqD) / (2*A)  -- высокий угол (навесной)
+        -- Предпочитаем низкоугольное решение
+        if t1 > -0.2 then tanTheta = t1
+        elseif t2 > -0.2 then tanTheta = t2
+        else tanTheta = 1.0 end
     end
-    -- Fallback: просто минимальная высота
-    local power = 4.0
-    local t = dist / (power * BALL_SPEED)
-    local vy = (dh + 0.5 * GRAVITY * t * t) / t
-    return power, math.max(vy, 1.0), t
+
+    -- Зажимаем угол: от -20° (-0.36) до +70° (2.75)
+    tanTheta = math.clamp(tanTheta, -0.364, 2.747)
+
+    local hDir     = horiz.Unit
+    local cosT     = 1 / math.sqrt(1 + tanTheta*tanTheta)
+    local sinT     = tanTheta * cosT
+    return Vector3.new(hDir.X*cosT, sinT, hDir.Z*cosT).Unit, disc >= 0
+end
+
+-- Power по дистанции: ближе = меньше силы, дальше = больше
+local function CalcPower(dist)
+    return math.clamp(dist / 35, 3.0, 7.0)
 end
 
 local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
@@ -334,114 +354,116 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
     if dist > AutoShootMaxDistance then return nil end
 
     local startPos = HumanoidRootPart.Position
-    local halfW    = GoalWidth  / 2 - INSET
-    local halfH    = GoalHeight       -- высота ворот
+    local halfW    = GoalWidth / 2 - INSET
 
-    -- Сетка кандидатных точек в локальных координатах ворот
-    -- X: [-halfW, -halfW*0.5, 0, halfW*0.5, halfW]
-    -- Y: [0.4, 0.6, 0.8] × GoalHeight  (низ/середина/верх)
-    local xPoints = {-halfW, -halfW * 0.6, 0, halfW * 0.6, halfW}
-    local yFracs  = {0.2, 0.45, 0.75}
+    -- Сетка кандидатов: 5 позиций по X, 3 по высоте
+    -- Высоты: 20% / 50% / 80% от реальной высоты ворот
+    local xPoints = {-halfW, -halfW * 0.55, 0, halfW * 0.55, halfW}
+    local yFracs  = {0.20, 0.50, 0.80}
 
     local candidates = {}
 
     for _, xf in ipairs(xPoints) do
         for _, yf in ipairs(yFracs) do
             local localX = xf
-            local localY = yf * halfH  -- высота над полом ворот (studs)
+            local localY = yf * GoalHeight  -- высота над полом ворот (studs), РЕАЛЬНАЯ
 
-            -- 3D позиция кандидата
-            local worldPos = GoalCFrame * Vector3.new(localX, localY, 0)
+            -- 3D позиция цели (idealPos) — точка в плоскости ворот
+            local idealPos = GoalCFrame * Vector3.new(localX, localY, 0)
 
-            -- Расстояние до вратаря в плоскости ворот
-            local gkDistX = math.abs(gkX - localX)
-            local gkDistY = math.abs(gkY - localY)
+            -- Score: чем дальше от вратаря — тем лучше
+            local gkDistX  = math.abs(gkX - localX)
+            local gkDistY  = math.abs(gkY - localY)
             local gkDist2D = math.sqrt(gkDistX*gkDistX + gkDistY*gkDistY)
+            local score    = gkDist2D * 2.0
 
-            -- Базовый score = расстояние от GK (чем дальше — тем лучше)
-            local score = gkDist2D * 2.0
+            -- Бонус угловые зоны
+            if math.abs(localX) > halfW * 0.6 then score = score + 3.0 end
+            -- Бонус низкий мяч если GK стоит высоко
+            if gkY > GoalHeight * 0.5 and localY < GoalHeight * 0.3 then score = score + 4.0 end
+            -- Штраф центр
+            if math.abs(localX) < halfW * 0.2 then score = score - 2.0 end
 
-            -- Бонус за угловые зоны (GK сложнее туда прыгать)
-            local cornerBonus = (math.abs(localX) > halfW * 0.6) and 3.0 or 0.0
-            score = score + cornerBonus
-
-            -- Бонус за низкий мяч если GK стоит высоко
-            if gkY > halfH * 0.5 and localY < halfH * 0.3 then
-                score = score + 4.0
+            -- Штраф если GK rush и он прямо на пути
+            if isAggressive and gkHrp then
+                local shootVec = (idealPos - startPos).Unit
+                local gkVec    = (gkHrp.Position - startPos).Unit
+                local dot = shootVec:Dot(gkVec)
+                score = score + (dot > 0.92 and -8.0 or 5.0)
             end
 
-            -- Штраф за центр (GK обычно стоит по центру)
-            if math.abs(localX) < halfW * 0.2 then
-                score = score - 2.0
-            end
+            -- Power по дистанции
+            local power = CalcPower(dist)
+            local speed = power * AutoShootBallSpeed
 
-            -- Если GK rush — стреляем поверх него или мимо
-            if isAggressive then
-                local gkWorldPos = gkHrp and gkHrp.Position or nil
-                if gkWorldPos then
-                    local shootDir2D = (worldPos - startPos)
-                    local gkDir2D    = (gkWorldPos - startPos)
-                    local dot = shootDir2D.Unit:Dot(gkDir2D.Unit)
-                    if dot > 0.92 then
-                        score = score - 8.0  -- GK прямо на пути
-                    else
-                        score = score + 5.0  -- стреляем мимо
-                    end
-                end
-            end
-
-            -- Физика: power и vy
-            local power, vy, flightTime = CalcPowerAndHeight(dist, localY)
-
-            -- Решение о спине:
-            -- Спин нужен если вратарь близко к выбранной точке (gkDist2D < 5)
-            -- и дистанция достаточная (> 60 studs) чтобы спин успел сработать
-            local useSpin = false
+            -- Решение о спине
             local spinDir = "None"
-            if dist > 60 and gkDist2D < 5.5 then
-                useSpin = true
-                -- Спин направлен ОТ вратаря: если GK правее цели → крутим влево (Left)
+            if dist > 65 and gkDist2D < 5.5 then
+                -- GK близко к цели → спин огибает его
                 spinDir = (gkX > localX) and "Left" or "Right"
-                score = score + 2.0  -- спин помогает
-            elseif dist > 100 then
-                -- Далеко: иногда добавляем спин для непредсказуемости
-                -- только если угол к воротам небольшой
-                local goalDir = (GoalCFrame.Position - startPos).Unit
-                local forwardDir = HumanoidRootPart.CFrame.LookVector
-                local angle = math.deg(math.acos(math.clamp(goalDir:Dot(forwardDir), -1, 1)))
-                if angle < 20 then
-                    useSpin = true
-                    spinDir = (localX >= 0) and "Right" or "Left"
+                score   = score + 2.0
+            elseif dist > 105 then
+                local goalDir    = (GoalCFrame.Position - startPos).Unit
+                local fwdDir     = HumanoidRootPart.CFrame.LookVector
+                local fwdAngle   = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
+                if fwdAngle < 20 then
+                    spinDir = localX >= 0 and "Right" or "Left"
                 end
             end
 
-            -- Деривация (боковое смещение от спина)
+            -- Деривация спина (горизонтальный сдвиг прицела)
             local derivation = 0
-            if useSpin then
-                local dMult = math.clamp((dist / 100)^1.5 * 1.2, 0.3, 4.0)
-                derivation = (spinDir == "Left" and 1 or -1) * dMult * power
+            if spinDir ~= "None" then
+                local dMult  = math.clamp((dist / 100)^1.5 * 1.2, 0.3, 4.0)
+                derivation   = (spinDir == "Left" and 1 or -1) * dMult * power
             end
-            local spinWorldPos = GoalCFrame * Vector3.new(
-                math.clamp(localX + derivation, -GoalWidth/2+0.3, GoalWidth/2-0.3),
-                localY, 0)
+
+            -- shootPos = с учётом деривации (реальная точка куда направляем мяч)
+            local shootLocalX = math.clamp(localX + derivation, -GoalWidth/2+0.3, GoalWidth/2-0.3)
+            local shootPos    = GoalCFrame * Vector3.new(shootLocalX, localY, 0)
+
+            -- *** БАЛЛИСТИКА: рассчитываем LaunchDir с учётом гравитации ***
+            -- Мы направляем ствол выше цели так чтобы дуга опустила мяч в shootPos
+            local launchDir, trajOk = CalcLaunchDir(startPos, shootPos, speed)
+
+            -- Штраф если траектория невозможна при данном power
+            if not trajOk then score = score - 5.0 end
+
+            -- AimPoint: куда реально направлен ствол (экстраполяция launchDir до плоскости ворот)
+            -- dist_to_goal_plane ≈ dist (горизонтальное)
+            local horizToGoal = Vector3.new(shootPos.X - startPos.X, 0, shootPos.Z - startPos.Z).Magnitude
+            local aimPoint    = startPos + launchDir * (horizToGoal / math.max(math.abs(launchDir.X) + math.abs(launchDir.Z), 0.01))
+            -- Проще: масштабируем launchDir до той же горизонтальной дальности
+            local cosAim = math.sqrt(launchDir.X^2 + launchDir.Z^2)
+            if cosAim > 0.01 then
+                local tAim = horizToGoal / (speed * cosAim)
+                aimPoint   = startPos + Vector3.new(
+                    launchDir.X * speed * tAim,
+                    launchDir.Y * speed * tAim - 0.5 * GRAVITY * tAim * tAim,
+                    launchDir.Z * speed * tAim
+                )
+            else
+                aimPoint = shootPos
+            end
 
             table.insert(candidates, {
-                idealPos  = worldPos,    -- куда ХОТИМ попасть (красный бокс)
-                shootPos  = spinWorldPos, -- реальная позиция с учётом спина (зелёный бокс)
+                idealPos  = idealPos,    -- красный бокс: куда прилетит мяч
+                aimPoint  = aimPoint,    -- зелёный бокс: куда направлен ствол
+                shootPos  = shootPos,    -- целевая точка с деривацией (для отладки)
+                launchDir = launchDir,   -- направление вылета (с дугой!)
                 localX    = localX,
                 localY    = localY,
                 spin      = spinDir,
                 power     = power,
-                vy        = vy,
+                speed     = speed,
                 score     = score,
                 gkDist    = gkDist2D,
+                trajOk    = trajOk,
             })
         end
     end
 
     if #candidates == 0 then return nil end
-
-    -- Выбираем лучший
     table.sort(candidates, function(a,b) return a.score > b.score end)
     return candidates[1]
 end
@@ -476,19 +498,29 @@ local function CalculateTarget()
         return
     end
 
-    TargetPoint      = result.shootPos
-    LastShootRedBox  = result.idealPos   -- красный бокс = идеальная точка
-    CurrentSpin      = result.spin
-    CurrentPower     = result.power
-    CurrentType      = string.format("X=%.1f Y=%.1f gk=%.1f", result.localX, result.localY, result.gkDist)
-    ShootDir         = (TargetPoint - HumanoidRootPart.Position).Unit
-    ShootVel         = ShootDir * (result.power * BALL_SPEED)
+    -- ShootDir = баллистический вектор (с учётом дуги), НЕ прямая линия к цели
+    ShootDir       = result.launchDir
+    ShootVel       = ShootDir * result.speed
+    CurrentSpin    = result.spin
+    CurrentPower   = result.power
+    CurrentType    = string.format("X=%.1f Y=%.1f gk=%.1f%s",
+                        result.localX, result.localY, result.gkDist,
+                        result.trajOk and "" or " [!arc]")
+
+    -- Боксы:
+    -- Красный = куда ПРИЛЕТИТ мяч (предикция по траектории = idealPos)
+    -- Зелёный = куда направлен ствол (aimPoint, выше цели из-за дуги)
+    PredictedLand  = result.idealPos
+    AimPoint       = result.aimPoint
+    TargetPoint    = result.shootPos  -- для совместимости (hasBall check)
 
     if Gui then
-        Gui.Target.Text = "→ " .. CurrentType
-        Gui.Power.Text  = string.format("Power: %.1f | Spin: %s", CurrentPower, CurrentSpin)
-        Gui.Spin.Text   = string.format("vy=%.1f dist=%.0f", result.vy, dist)
-        Gui.Goal.Text   = string.format("Goal W=%.1f H=%.1f", GoalWidth, GoalHeight)
+        Gui.Target.Text = string.format("→ X=%.1f Y=%.1f/%.1f", result.localX, result.localY, GoalHeight)
+        Gui.Power.Text  = string.format("Power: %.1f | Spin: %s | %s",
+                            CurrentPower, CurrentSpin, result.trajOk and "arc OK" or "arc FAIL")
+        Gui.Spin.Text   = string.format("spd=%.0f dist=%.0f gk=%.1f",
+                            result.speed, dist, result.gkDist)
+        Gui.Goal.Text   = string.format("Goal W=%.1f H=%.1f floor=%.1f", GoalWidth, GoalHeight, GoalFloorY)
     end
 end
 
@@ -641,21 +673,25 @@ AutoShoot.Start = function()
 
     AutoShootStatus.RenderConnection = RunService.RenderStepped:Connect(function()
         local width = UpdateGoal()
-        -- Красный бокс = ЖЕЛАЕМАЯ точка попадания (куда мы хотели, до деривации спина)
-        if LastShootRedBox then
-            DrawOrientedCube(GoalCube, CFrame.new(LastShootRedBox), Vector3.new(3,3,3))
-        else
-            for _, l in ipairs(GoalCube) do l.Visible = false end
-        end
-        -- Зелёный бокс = реальная точка прицела (с учётом спина)
-        if TargetPoint then
-            DrawOrientedCube(TargetCube, CFrame.new(TargetPoint), Vector3.new(4,4,4))
+
+        -- 🟢 Зелёный = AimPoint (куда направлен ShootDir с учётом дуги; выше цели)
+        if AimPoint then
+            DrawOrientedCube(TargetCube, CFrame.new(AimPoint), Vector3.new(3,3,3))
         else
             for _, l in ipairs(TargetCube) do l.Visible = false end
         end
-        -- Голубой бокс = ворота целиком
-        if GoalCFrame and width then
-            DrawOrientedCube(NoSpinCube, GoalCFrame * CFrame.new(0, GoalHeight/2, 0), Vector3.new(width, GoalHeight, 2))
+
+        -- 🔴 Красный = PredictedLand (куда МЯЧ ПРИЛЕТИТ с учётом траектории = idealPos)
+        if PredictedLand then
+            DrawOrientedCube(GoalCube, CFrame.new(PredictedLand), Vector3.new(3,3,3))
+        else
+            for _, l in ipairs(GoalCube) do l.Visible = false end
+        end
+
+        -- 🔵 Голубой = габарит ворот (W × H) — реальные размеры
+        if GoalCFrame and width and GoalHeight then
+            DrawOrientedCube(NoSpinCube, GoalCFrame * CFrame.new(0, GoalHeight/2, 0),
+                Vector3.new(width, GoalHeight, 1))
         else
             for _, l in ipairs(NoSpinCube) do l.Visible = false end
         end
@@ -751,6 +787,14 @@ local function SetupUI(UI)
             Callback = function(v) AutoShootMaxDistance = v end
         }, "AutoShootMaxDist")
 
+        uiElements.AutoShootBallSpeed = UI.Sections.AutoShoot:Slider({
+            Name = "Ball Speed (calibrate!)", Minimum = 80, Maximum = 400,
+            Default = AutoShootBallSpeed, Precision = 1,
+            Callback = function(v) AutoShootBallSpeed = v end
+        }, "AutoShootBallSpeed")
+
+        UI.Sections.AutoShoot:SubLabel({Text = "[ℹ] Ball Speed: увеличь если мяч летит выше цели, уменьши если ниже"})
+
         UI.Sections.AutoShoot:Divider()
 
         uiElements.AutoShootSpoofPower = UI.Sections.AutoShoot:Toggle({
@@ -811,7 +855,7 @@ function AutoShootModule.Init(UI, coreParam, notifyFunc)
         BallAttachment   = newChar:WaitForChild("ball")
         RShootAnim       = Humanoid:LoadAnimation(Animations:WaitForChild("RShoot"))
         RShootAnim.Priority = Enum.AnimationPriority.Action4
-        GoalCFrame = nil; TargetPoint = nil; LastShootRedBox = nil
+        GoalCFrame = nil; TargetPoint = nil; PredictedLand = nil; AimPoint = nil
         LastShoot = 0; IsAnimating = false; CanShoot = true
         if AutoShootEnabled then AutoShoot.Start() end
         if AutoPickupEnabled then AutoPickup.Start() end
