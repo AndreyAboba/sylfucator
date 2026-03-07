@@ -40,20 +40,11 @@ local AutoShootButtonScale  = 1.0
 local AutoShootSpoofPowerEnabled = false
 local AutoShootSpoofPowerType    = "math.huge"
 -- Физика
--- ── Физика ──────────────────────────────────────────────────────────────────
--- GRAVITY:       гравитация Roblox (196.2 studs/s²)
--- AutoShootBallSpeed: реальная скорость мяча в studs/s, которую выдаёт сервер.
---   Power-параметр в игре НЕ влияет на скорость (только очень низкие <0.3).
---   Калибруй: если мяч летит ВЫШЕ цели → уменьши; НИЖЕ → увеличь.
--- AutoShootDrag: коэффициент линейного затухания скорости (air drag).
---   Roblox: AssemblyLinearVelocity затухает как v(t)=v0*e^(-drag*t).
---   Калибруй: если мяч НЕ ДОЛЕТАЕТ на дальних → увеличь Drag или уменьши BallSpeed.
--- INSET: отступ от штанг внутрь (studs)
-local GRAVITY            = 196.2
-local AutoShootBallSpeed = 240   -- studs/s; калибруй!
-local AutoShootDrag      = 0.40  -- 0 = без затухания; 0.4 = умеренное
-local FIXED_POWER        = 5.0   -- power на сервер (игнорируется им, но нужен)
-local INSET              = 1.5
+local GRAVITY              = 196.2   -- studs/s² (Roblox workspace gravity)
+local AutoShootBallSpeed   = 380     -- Скорость мяча studs/s. Мяч выше цели → увеличь. Мяч ниже → уменьши.
+local AutoShootDragComp    = 0.10    -- Компенсация трения (studs / stud дистанции × 0.01). Мяч не долетает → увеличь.
+local FIXED_POWER          = 5.0    -- Power отправляемый на сервер (не влияет на траекторию, константа)
+local INSET                = 1.5    -- отступ от штанг внутрь (studs)
 
 -- ============================================================
 -- STATUS
@@ -135,60 +126,38 @@ local function InitializeCubes()
     SC(PeakCube,   Color3.fromRGB(255,255,0), 4)   -- 🟡 жёлтый = пик дуги
 end
 
--- Аналитическая позиция мяча в момент t с учётом drag и гравитации.
--- Модель: dv/dt = -gravity*Y - drag*v  (линейное затухание + гравитация)
--- Решение: v_horiz(t) = v0h * e^(-drag*t)
---          v_vert(t)  = (v0y + g/drag)*e^(-drag*t) - g/drag
---          x(t) = (v0h/drag)*(1 - e^(-drag*t))         [с drag]
---          y(t) = (v0y/drag + g/drag²)*(1-e^(-drag*t)) - g*t/drag  [с drag]
---          (при drag→0 вырождается в стандартную параболу)
-local function BallPos(startPos, launchDir, v0, drag, t)
-    if drag < 0.001 then
-        -- Без затухания: простая парабола
-        return startPos + Vector3.new(
-            launchDir.X * v0 * t,
-            launchDir.Y * v0 * t - 0.5 * GRAVITY * t * t,
-            launchDir.Z * v0 * t
+-- DrawTrajectory: рисует параболу полёта с учётом drag.
+-- Drag моделируется как затухание горизонтальной скорости: v_h(t) = V*cos(θ)*exp(-k*t)
+-- где k = AutoShootDragComp * 0.1.  Вертикальная скорость практически не затухает.
+-- Это приближение — достаточно точно для визуализации.
+local function DrawTrajectory(startPos, launchDir, flightTime)
+    local V  = AutoShootBallSpeed
+    local vx0 = launchDir.X * V
+    local vy0 = launchDir.Y * V
+    local vz0 = launchDir.Z * V
+    local k   = AutoShootDragComp * 0.1  -- коэффициент затухания
+
+    -- Вычисляем позицию в момент t с учётом drag
+    local function BallPos(t)
+        local hFactor = (k > 0.001) and ((1 - math.exp(-k*t)) / k) or t
+        return Vector3.new(
+            startPos.X + vx0 * hFactor,
+            startPos.Y + vy0 * t - 0.5 * GRAVITY * t * t,
+            startPos.Z + vz0 * hFactor
         )
     end
-    local ex = math.exp(-drag * t)
-    local inv = 1 - ex
-    local gd  = GRAVITY / drag
-    return Vector3.new(
-        startPos.X + (launchDir.X * v0 / drag) * inv,
-        startPos.Y + (launchDir.Y * v0 / drag + GRAVITY / (drag * drag)) * inv - gd * t,
-        startPos.Z + (launchDir.Z * v0 / drag) * inv
-    )
-end
 
--- Время полёта до горизонтальной дистанции R.
--- hCosT = горизонтальная составляющая launchDir (sqrt(dx²+dz²))
-local function BallFlightTime(v0, hCosT, R, drag)
-    local vx0 = v0 * hCosT
-    if vx0 < 0.001 then return nil end
-    if drag < 0.001 then return R / vx0 end
-    local ratio = R * drag / vx0
-    if ratio >= 0.9999 then return nil end  -- не долетит
-    return -math.log(1 - ratio) / drag
-end
-
--- Рисует дугу мяча — 20 сегментов, аналитически с drag
-local function DrawTrajectory(startPos, launchDir, v0, drag, flightTime)
     for i = 1, TRAJ_SEGMENTS do
         local t0 = flightTime * (i-1) / TRAJ_SEGMENTS
         local t1 = flightTime * i     / TRAJ_SEGMENTS
-        local p0 = BallPos(startPos, launchDir, v0, drag, t0)
-        local p1 = BallPos(startPos, launchDir, v0, drag, t1)
-        local s0, ok0 = Camera:WorldToViewportPoint(p0)
-        local s1, ok1 = Camera:WorldToViewportPoint(p1)
+        local p0 = BallPos(t0)
+        local p1 = BallPos(t1)
+        local s0, v0 = Camera:WorldToViewportPoint(p0)
+        local s1, v1 = Camera:WorldToViewportPoint(p1)
         local l = TrajectoryLines[i]
-        if ok0 and ok1 and s0.Z > 0 and s1.Z > 0 then
-            l.From = Vector2.new(s0.X, s0.Y)
-            l.To   = Vector2.new(s1.X, s1.Y)
-            l.Visible = true
-        else
-            l.Visible = false
-        end
+        if v0 and v1 and s0.Z > 0 and s1.Z > 0 then
+            l.From = Vector2.new(s0.X, s0.Y); l.To = Vector2.new(s1.X, s1.Y); l.Visible = true
+        else l.Visible = false end
     end
 end
 
@@ -372,15 +341,14 @@ end
 
 -- ============================================================
 -- ЯДРО: БАЛЛИСТИКА + SMART TARGET SELECTION
--- ============================================================
--- ФИЗИЧЕСКОЕ ЯДРО с drag (линейное затухание скорости)
--- Модель: dv/dt = -g*ĵ - drag*v
--- Аналитическое решение:
---   vx(t) = vx0 * e^(-drag*t)
---   vy(t) = (vy0 + g/drag)*e^(-drag*t) - g/drag
---   x(t)  = (vx0/drag)*(1 - e^(-drag*t))
---   y(t)  = (vy0/drag + g/drag²)*(1 - e^(-drag*t)) - g*t/drag
--- При drag→0 формулы вырождаются в простую параболу (проверяется).
+-- CalcLaunchDir: решает обратную задачу траектории.
+-- Нам нужно попасть в точку targetPos стартуя из startPos.
+-- Мяч летит под углом θ с начальной скоростью v.
+-- По горизонтали: dist = v*cos(θ)*t  →  t = dist/(v*cos(θ))
+-- По вертикали:   dh   = v*sin(θ)*t - 0.5*g*t²
+-- Подстановка t и u=tan(θ):
+--   k*u² - dist*u + (dh+k) = 0  где k = g*dist²/(2*v²)
+-- Берём низкоугольное решение (более прямой удар).
 -- ============================================================
 local TargetPoint, ShootDir, ShootVel, CurrentSpin, CurrentPower, CurrentType
 local AimPoint          = nil
@@ -392,111 +360,48 @@ local CurrentPeakPos    = nil
 local LastShoot = 0
 local CanShoot  = true
 
--- Позиция мяча в момент t (аналитически, без итераций)
-local function BallPos(startPos, launchDir, v0, drag, t)
-    if drag < 0.001 then
-        return startPos + Vector3.new(
-            launchDir.X * v0 * t,
-            launchDir.Y * v0 * t - 0.5 * GRAVITY * t * t,
-            launchDir.Z * v0 * t)
-    end
-    local ex  = math.exp(-drag * t)
-    local inv = 1.0 - ex
-    return Vector3.new(
-        startPos.X + (launchDir.X * v0 / drag) * inv,
-        startPos.Y + (launchDir.Y * v0 / drag + GRAVITY / (drag*drag)) * inv - (GRAVITY/drag) * t,
-        startPos.Z + (launchDir.Z * v0 / drag) * inv)
-end
+-- CalcLaunchDir: первопорядковая коррекция гравитации + трение.
+--
+-- Принцип: мяч летит со скоростью V (константа, не зависит от power).
+-- За время полёта t ≈ horizDist/V гравитация роняет его на Δy_g = 0.5*g*t².
+-- Трение замедляет мяч → он падает ещё ниже → компенсируем дополнительной высотой Δy_d.
+-- Решение: целимся в точку targetPos + Vector3.yAxis*(Δy_g + Δy_d).
+-- В отличие от квадратного уравнения — не зависит от точности оценки V.
+-- Ошибка ≈ O((Δy/horizDist)²) — мала при небольших углах.
+--
+-- Возвращает: launchDir (unit vector), horizDist, flightTime
+local function CalcLaunchDir(startPos, targetPos)
+    local toTarget  = targetPos - startPos
+    local horiz     = Vector3.new(toTarget.X, 0, toTarget.Z)
+    local horizDist = horiz.Magnitude
 
--- Время полёта до горизонтальной дистанции R
--- hCosT = горизонтальная составляющая launchDir (sqrt(Lx²+Lz²))
-local function BallFlightTime(v0, hCosT, R, drag)
-    local vx0 = v0 * hCosT
-    if vx0 < 0.001 then return nil end
-    if drag < 0.001 then return R / vx0 end
-    local ratio = R * drag / vx0
-    if ratio >= 0.9999 then return nil end
-    return -math.log(1.0 - ratio) / drag
-end
-
--- Высота мяча когда он достигает горизонтальной дистанции R,
--- при угле вылета tanTheta = tan(θ)
-local function yAtRange(tanTheta, v0, drag, R)
-    local theta = math.atan(tanTheta)
-    local cosT  = math.cos(theta)
-    local sinT  = math.sin(theta)
-    if cosT < 0.005 then return nil end
-    local t = BallFlightTime(v0, cosT, R, drag)
-    if not t then return nil end
-    if drag < 0.001 then
-        return v0 * sinT * t - 0.5 * GRAVITY * t * t, t
-    end
-    local ex = math.exp(-drag * t)
-    return (v0 * sinT / drag + GRAVITY / (drag*drag)) * (1 - ex) - (GRAVITY/drag) * t, t
-end
-
--- Найти угол вылета (бинарный поиск) чтобы попасть в targetPos.
--- Возвращает: launchDir (unit), flightTime (sec), ok (bool)
-local function CalcLaunchDir(startPos, targetPos, v0, drag)
-    local toTarget = targetPos - startPos
-    local horizVec = Vector3.new(toTarget.X, 0, toTarget.Z)
-    local R        = horizVec.Magnitude
-    local dh       = toTarget.Y
-    if R < 0.5 then return Vector3.new(0, 1, 0), 0.1, true end
-    local hDir = horizVec.Unit
-
-    local lo, hi = -1.0, 4.0
-    local yLo    = yAtRange(lo, v0, drag, R)
-    local yHi    = yAtRange(hi, v0, drag, R)
-
-    -- Сузить hi если угол слишком крутой (недостижимо из-за drag)
-    for _ = 1, 20 do
-        if yHi ~= nil then break end
-        hi  = (lo + hi) / 2
-        yHi = yAtRange(hi, v0, drag, R)
+    if horizDist < 0.5 then
+        return Vector3.new(0, 1, 0), 0, 0.1
     end
 
-    -- Fallback: если не можем покрыть dh → используем лучший доступный угол
-    if yLo == nil then
-        local dir = Vector3.new(hDir.X * 0.866, 0.5, hDir.Z * 0.866).Unit
-        local ft  = BallFlightTime(v0, 0.866, R, drag) or (R / (v0 * 0.866))
-        return dir, ft, false
-    end
-    if yHi ~= nil and yHi < dh then
-        -- Максимальный угол всё ещё ниже цели — берём максимум
-        local theta = math.atan(hi)
-        local cosT  = math.cos(theta); local sinT = math.sin(theta)
-        local ft    = BallFlightTime(v0, cosT, R, drag) or (R / math.max(v0*cosT, 0.01))
-        return Vector3.new(hDir.X*cosT, sinT, hDir.Z*cosT).Unit, ft, false
-    end
-    if yLo ~= nil and yLo > dh then
-        -- Даже минимальный угол выше цели — берём минимум
-        local theta = math.atan(lo)
-        local cosT  = math.cos(theta); local sinT = math.sin(theta)
-        local ft    = BallFlightTime(v0, cosT, R, drag) or (R / math.max(v0*cosT, 0.01))
-        return Vector3.new(hDir.X*cosT, sinT, hDir.Z*cosT).Unit, ft, false
-    end
+    local V = AutoShootBallSpeed
+    -- Приблизительное время полёта (горизонтальная скорость ≈ V)
+    local t = horizDist / V
 
-    -- Бинарный поиск: 50 итераций
-    for _ = 1, 50 do
-        local mid = (lo + hi) / 2
-        local y   = yAtRange(mid, v0, drag, R)
-        if y == nil then
-            hi = mid
-        elseif y < dh then
-            lo = mid
-        else
-            hi = mid
-        end
-    end
+    -- Поправка гравитации: за t секунд мяч опустится на Δy_g
+    local gravComp = 0.5 * GRAVITY * t * t
 
-    local tanBest = (lo + hi) / 2
-    local theta   = math.atan(tanBest)
-    local cosT    = math.cos(theta)
-    local sinT    = math.sin(theta)
-    local ft      = BallFlightTime(v0, cosT, R, drag) or (R / math.max(v0 * cosT, 0.01))
-    return Vector3.new(hDir.X*cosT, sinT, hDir.Z*cosT).Unit, ft, true
-end
+    -- Поправка трения: линейно растёт с дистанцией
+    -- AutoShootDragComp — studs дополнительной высоты на каждые 10 studs дистанции
+    local dragComp = AutoShootDragComp * horizDist * 0.1
+
+    -- Поднимаем целевую точку на обе поправки
+    local corrY = targetPos.Y + gravComp + dragComp
+
+    -- Вектор до скорректированной точки
+    local corrected = Vector3.new(targetPos.X, corrY, targetPos.Z)
+    local dir       = (corrected - startPos).Unit
+
+    -- Реальное время полёта с учётом косинуса угла
+    local cosAngle  = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
+    local realT     = (cosAngle > 0.01) and (horizDist / (V * cosAngle)) or t
+
+    return dir, horizDist, realT
 end
 
 local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
@@ -557,7 +462,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
                 score = score + (dot > 0.92 and -10.0 or 6.0)
             end
 
-            -- Power фиксированный (сервер его игнорирует); скорость задаётся слайдером
+            -- Power не влияет на траекторию → константа
             local power = FIXED_POWER
             local speed = AutoShootBallSpeed
 
@@ -587,33 +492,38 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp)
             local shootLocalX = math.clamp(localX + derivation, -GoalWidth/2+0.3, GoalWidth/2-0.3)
             local shootPos    = GoalCFrame * Vector3.new(shootLocalX, localY, 0)
 
-            -- *** БАЛЛИСТИКА: рассчитываем LaunchDir с учётом гравитации ***
-            -- Мы направляем ствол выше цели так чтобы дуга опустила мяч в shootPos
-            local launchDir, flightTimeRaw, trajOk = CalcLaunchDir(startPos, shootPos, speed, AutoShootDrag)
+            -- *** БАЛЛИСТИКА: рассчитываем LaunchDir с учётом гравитации + трения ***
+            local launchDir, horizD, flightT = CalcLaunchDir(startPos, shootPos)
+            local trajOk = (launchDir.Y < 0.85)  -- угол <58° — нормально
 
             -- Штраф если траектория невозможна при данном power
             if not trajOk then score = score - 5.0 end
 
-            -- AimPoint: куда смотрит ствол в момент вылета (extrapolation launchDir → цель)
-            -- = позиция мяча на половине пути (mid-flight), чтобы бокс был заметен
-            local aimPoint = BallPos(startPos, launchDir, speed, AutoShootDrag, flightTime * 0.4)
-
-            -- Время полёта получено из CalcLaunchDir (с drag)
-            local flightTime   = flightTimeRaw or 0.5
-            local horizToShoot = Vector3.new(shootPos.X-startPos.X, 0, shootPos.Z-startPos.Z).Magnitude
-            local cosH = math.sqrt(launchDir.X^2 + launchDir.Z^2)
-            -- Пик дуги с drag: vy(t)=0  →  (vy0+g/drag)*e^(-drag*tPeak) = g/drag
-            -- → tPeak = ln(1 + vy0*drag/g) / drag  (при drag>0)
-            local vy0    = launchDir.Y * speed
-            local tPeak
-            if AutoShootDrag < 0.001 then
-                tPeak = math.max(vy0 / GRAVITY, 0)
+            -- AimPoint: где физически находится мяч в момент пересечения плоскости ворот
+            -- Это точка на НАШЕЙ параболе при t=flightT (должна совпасть с shootPos если формула верна)
+            local V    = AutoShootBallSpeed
+            local cosA = math.sqrt(launchDir.X^2 + launchDir.Z^2)
+            local aimPoint
+            if cosA > 0.01 and flightT > 0 then
+                aimPoint = Vector3.new(
+                    startPos.X + launchDir.X * V * flightT,
+                    startPos.Y + launchDir.Y * V * flightT - 0.5 * GRAVITY * flightT * flightT,
+                    startPos.Z + launchDir.Z * V * flightT
+                )
             else
-                local r = 1 + vy0 * AutoShootDrag / GRAVITY
-                tPeak = (r > 0) and (math.log(r) / AutoShootDrag) or 0
+                aimPoint = shootPos
             end
-            tPeak = math.clamp(tPeak, 0, flightTime)
-            local peakPos = BallPos(startPos, launchDir, speed, AutoShootDrag, tPeak)
+
+            -- flightTime уже рассчитан CalcLaunchDir
+            local flightTime = flightT
+            -- Пик дуги: момент когда vy - g*t = 0
+            local vyComp  = launchDir.Y * speed
+            local tPeak   = math.max(vyComp / GRAVITY, 0)
+            local peakPos = startPos + Vector3.new(
+                launchDir.X * speed * tPeak,
+                launchDir.Y * speed * tPeak - 0.5 * GRAVITY * tPeak * tPeak,
+                launchDir.Z * speed * tPeak
+            )
             table.insert(candidates, {
                 idealPos   = idealPos,
                 aimPoint   = aimPoint,
@@ -670,9 +580,11 @@ local function CalculateTarget()
     end
 
     ShootDir       = result.launchDir
-    ShootVel       = ShootDir * AutoShootBallSpeed  -- скорость = фиксированная, power сервер игнорирует
+    -- ShootVel: сохраняем старую магнитуду (FIXED_POWER * 1400) чтобы сервер принял
+    -- direction — новая (с поправкой на гравитацию), magnitude — как в оригинале
+    ShootVel       = ShootDir * (FIXED_POWER * 1400)
     CurrentSpin    = result.spin
-    CurrentPower   = FIXED_POWER
+    CurrentPower   = FIXED_POWER  -- power константа, не влияет на траекторию
     CurrentType    = string.format("%sX=%.1f Y=%.1f/%.1f gk=%.1f",
                         result.isTopCorner and "[TC] " or "",
                         result.localX, result.localY, GoalHeight, result.gkDist)
@@ -691,10 +603,14 @@ local function CalculateTarget()
 
     if Gui then
         Gui.Target.Text = string.format("→ X=%.1f Y=%.1f/%.1f", result.localX, result.localY, GoalHeight)
-        Gui.Power.Text  = string.format("Power: %.1f | Spin: %s | %s",
-                            CurrentPower, CurrentSpin, result.trajOk and "arc OK" or "arc FAIL")
-        Gui.Spin.Text   = string.format("spd=%.0f dist=%.0f gk=%.1f",
-                            result.speed, dist, result.gkDist)
+        local cosA_d = math.sqrt(result.launchDir.X^2 + result.launchDir.Z^2)
+        local launchAngle = math.deg(math.atan(result.launchDir.Y / math.max(cosA_d, 0.01)))
+        Gui.Power.Text  = string.format("θ=%.1f° t=%.2fs %s | Spin=%s",
+                            launchAngle, result.flightTime,
+                            result.trajOk and "OK" or "!steep",
+                            result.spin)
+        Gui.Spin.Text   = string.format("V=%.0f drag=%.2f dist=%.0f gk=%.1f",
+                            AutoShootBallSpeed, AutoShootDragComp, dist, result.gkDist)
         Gui.Goal.Text   = string.format("Goal W=%.1f H=%.1f floor=%.1f", GoalWidth, GoalHeight, GoalFloorY)
     end
 end
@@ -852,7 +768,7 @@ AutoShoot.Start = function()
 
         -- 🟠 Траектория дуги (оранжевые линии) — главный визуал
         if hasTarget and CurrentLaunchDir and CurrentFlightTime > 0 then
-            DrawTrajectory(HumanoidRootPart.Position, CurrentLaunchDir, CurrentSpeed, AutoShootDrag, CurrentFlightTime)
+            DrawTrajectory(HumanoidRootPart.Position, CurrentLaunchDir, CurrentFlightTime)
         else
             for _, l in ipairs(TrajectoryLines) do l.Visible = false end
         end
@@ -982,19 +898,18 @@ local function SetupUI(UI)
         }, "AutoShootMaxDist")
 
         uiElements.AutoShootBallSpeed = UI.Sections.AutoShoot:Slider({
-            Name = "Ball Speed", Minimum = 50, Maximum = 600,
+            Name = "Ball Speed", Minimum = 100, Maximum = 800,
             Default = AutoShootBallSpeed, Precision = 1,
             Callback = function(v) AutoShootBallSpeed = v end
         }, "AutoShootBallSpeed")
+        UI.Sections.AutoShoot:SubLabel({Text = "[↑] Мяч выше цели → увеличь  |  Мяч ниже → уменьши"})
 
-        uiElements.AutoShootDrag = UI.Sections.AutoShoot:Slider({
-            Name = "Air Drag", Minimum = 0.0, Maximum = 2.0,
-            Default = AutoShootDrag, Precision = 2,
-            Callback = function(v) AutoShootDrag = v end
-        }, "AutoShootDrag")
-
-        UI.Sections.AutoShoot:SubLabel({Text = "[ℹ] Ball Speed: реальная скорость мяча (studs/s). Мяч ВЫШЕ цели → уменьши. НИЖЕ → увеличь."})
-        UI.Sections.AutoShoot:SubLabel({Text = "[ℹ] Air Drag: затухание скорости. Мяч НЕ ДОЛЕТАЕТ → увеличь. ПЕРЕЛЕТАЕТ → уменьши."})
+        uiElements.AutoShootDragComp = UI.Sections.AutoShoot:Slider({
+            Name = "Drag Compensation", Minimum = 0, Maximum = 1.0,
+            Default = AutoShootDragComp, Precision = 2,
+            Callback = function(v) AutoShootDragComp = v end
+        }, "AutoShootDragComp")
+        UI.Sections.AutoShoot:SubLabel({Text = "[↑] Мяч не долетает → увеличь  |  Перелёт → уменьши"})
 
         UI.Sections.AutoShoot:Divider()
 
