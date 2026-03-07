@@ -42,7 +42,7 @@ local AutoShootSpoofPowerType    = "math.huge"
 -- Физика
 local GRAVITY              = 196.2   -- studs/s² (Roblox workspace gravity)
 local AutoShootBallSpeed   = 400     -- Скорость мяча studs/s. Мяч выше цели → увеличь. Мяч ниже → уменьши.
-local AutoShootDragComp    = 1.05    -- k (1/s): экспоненц. затухание v_h=V·e^(-k·t). Не долетает → увеличь. Летит выше → уменьши.
+local AutoShootDragComp    = 1.10    -- k (1/s): экспоненц. затухание v_h=V·e^(-k·t). Не долетает → увеличь. Летит выше → уменьши.
 local FIXED_POWER          = 5.0
 local GK_REACH_RADIUS      = 5.0    -- Радиус статичного покрытия GK (studs)
 local GK_REACH_SPEED       = 12.0   -- Скорость реакции GK для предикта дайва (studs/s)
@@ -450,15 +450,12 @@ local function CalcLaunchDir(startPos, targetPos)
         t = -math.log(1 - kd) / k
     end
 
-    -- Эффективная вертикальная потеря нарастает не мгновенно: на близких мяч летит почти в точку,
-    -- а после ~100 studs уже нужен подъём выше цели. Используем гладкий ramp по времени полёта.
-    local gravRamp = 1 - math.exp(- (t / 0.26) ^ 2)
-    local gravComp = 0.5 * GRAVITY * t * t * gravRamp
+    -- Чистая гравитационная компенсация: без ramp, без лишних слагаемых.
+    -- k=1.10 уже корректно учитывает дополнительное сопротивление воздуха через
+    -- время полёта t — чем дальше, тем больше t, тем больше gravComp.
+    local gravComp = 0.5 * GRAVITY * t * t
 
-    -- Небольшая дополнительная аэродинамическая потеря на дальних тоже растёт плавно по времени.
-    local aeroLoss = 0.18 * k * V * t * t * gravRamp
-
-    local corrY    = targetPos.Y + gravComp + aeroLoss
+    local corrY    = targetPos.Y + gravComp
     local dir      = (Vector3.new(targetPos.X, corrY, targetPos.Z) - startPos).Unit
     local cosAngle = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
 
@@ -523,12 +520,19 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             local pgkDistY  = math.abs(gkEffY - localY)
             local pgkDist2D = math.sqrt(pgkDistX*pgkDistX + pgkDistY*pgkDistY)
 
-            -- Основа: расстояние предиктной позиции GK от точки
-            -- Штраф если в зоне дайва: GK достанет
+            -- Base: ТОЛЬКО горизонтальное расстояние от GK, игнорируем pgkDistY в базе.
+            -- Причина: pgkY (HRP вратаря) ≈ GoalHeight на малых воротах, что делает
+            -- высокие цели визуально "близкими к GK" и портит выбор верхних углов.
             local reachability = math.clamp(1 - pgkDist2D / diveRange, 0, 1)
-            local score = pgkDist2D * 2.8 - reachability * 9.0
+            local score = pgkDistX * 4.0
+                        + (localY / math.max(GoalHeight, 1)) * 8.0
+                        - reachability * 8.0
+            -- Штраф если GK на той же высоте что и цель (может достать без прыжка)
+            if math.abs(pgkY - localY) < GK_REACH_RADIUS * 0.7 then
+                score = score - 4.5
+            end
 
-            local isTopCorner = (yf >= 0.60) and (math.abs(localX) > halfW * 0.5)
+            local isTopCorner = (yf >= 0.58) and (math.abs(localX) > halfW * 0.45)
             local isCorner    = math.abs(localX) > halfW * 0.5
             local isLobShot   = (yf >= 0.85)
 
@@ -686,10 +690,8 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             -- На ближних дистанциях реальная вертикальная потеря мала: безопасный потолок сильнее защищаем.
             local vyAtGoal = AutoShootBallSpeed * launchDir.Y - GRAVITY * flightT
             if vyAtGoal > 0 then
-                local gravRampHere = 1 - math.exp(- (flightT / 0.26) ^ 2)
-                local gravCompHere = 0.5 * GRAVITY * flightT * flightT * gravRampHere
-                local aeroLossHere = 0.18 * AutoShootDragComp * AutoShootBallSpeed * flightT * flightT * gravRampHere
-                local aimLocalY    = localY + gravCompHere + aeroLossHere
+                local gravCompHere = 0.5 * GRAVITY * flightT * flightT
+                local aimLocalY    = localY + gravCompHere
                 local safeTop      = GoalHeight - Y_TOP_SAFETY
                 if aimLocalY > safeTop then
                     local over = aimLocalY - safeTop
@@ -746,7 +748,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
     --   Нормаль отражения = горизонтальный вектор от штанги к центру ворот
     --   d_out = d_in - 2*(d_in·n)*n
     -- ================================================================
-    local ricochetEnabled = (dist > 15)  -- рикошет бесполезен вплотную
+    local ricochetEnabled = (dist > 15 and dist < 110)  -- рикошет бесполезен вплотную и на дальних
     if ricochetEnabled then
         local postDefs = {
             { side =  1, postLocalX = -GoalWidth/2 },  -- левая штанга, нормаль = +X (вправо)
