@@ -593,44 +593,38 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             local power = FIXED_POWER
             local speed = AutoShootBallSpeed
 
-            -- Решение о спине
+            -- Решение о спине.
+            -- ПРАВИЛО ИГРЫ (инверсия): "Right" label → мяч ВЛЕВО, "Left" label → мяч ВПРАВО.
+            -- Деривация всегда компенсирует снос: "Right"→+dMult, "Left"→−dMult.
+            --
+            -- Причина старых багов: условия b и c добавляли спин при dist < SPIN_TRICK_DIST,
+            -- где velMult ≈ 3×. Реальный снос сервером ≈ 3× больше нашего dMult → мяч
+            -- вылетал за ворота, что выглядело как "реверсия". Поэтому только v36_9-условия:
             local spinDir = "None"
-            -- ВАЖНО: в игре спин инвертирован относительно интуиции:
-            --   "Right" label → мяч летит ВЛЕВО (Магнус)
-            --   "Left"  label → мяч летит ВПРАВО
-            -- Поэтому: GK справа → хотим огнуть ВЛЕВО → шлём "Right" на сервер
-            -- a) GK рядом с целью → огибаем в обратную от него сторону
-            if dist > 60 and gkDist2D < 5.5 then
+
+            -- a) GK рядом с целью (dist > 65, gkDist2D < 5.5) → огибаем ОТ вратаря
+            if dist > 65 and gkDist2D < 5.5 then
                 spinDir = (gkX > localX) and "Right" or "Left"
-                score   = score + 3.5
+                score   = score + 3.0
 
-            -- b) Угол (любой) при dist > 50 → закручиваем В угол (curl into post).
-            --    "Left" label огибает вправо → для правого угла мяч курлится к стойке.
-            --    Даёт эффект "залетает с края" — сложнее взять GK.
-            elseif dist > 50 and isCorner then
-                spinDir = (localX >= 0) and "Left" or "Right"
-                score   = score + 2.5  -- бонус за закрученный угол
-
-            -- c) Дальние дистанции: всегда добавляем спин (сложнее для GK)
-            elseif dist > 90 then
+            -- b) Дальние удары (dist > SPIN_TRICK_DIST = 72 → velMult ≈ 1.5×, безопасно)
+            --    Направление: для цели справа "Left" (→RIGHT в игре) закручивает к правой штанге.
+            elseif dist > SPIN_TRICK_DIST then
                 local goalDir  = (GoalCFrame.Position - startPos).Unit
                 local fwdDir   = HumanoidRootPart.CFrame.LookVector
                 local fwdAngle = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
-                -- Без жёсткой проверки угла — применяем спин почти всегда на дальних
-                if fwdAngle < 40 then
+                if fwdAngle < 30 then
                     spinDir = localX >= 0 and "Left" or "Right"
                     score   = score + 1.5
                 end
             end
 
-            -- Деривация: "Right" огибает ВЛЕВО → целимся ПРАВЕЕ цели (+dMult)
-            --            "Left"  огибает ВПРАВО → целимся ЛЕВЕЕ  (-dMult)
+            -- Деривация: "Right"→+dMult (цель правее), "Left"→−dMult (цель левее)
             local derivation = 0
             if spinDir ~= "None" then
                 local dMult  = AutoShootDerivMult * (dist / 100)^2
                 derivation   = (spinDir == "Right" and 1 or -1) * dMult
-                -- Закрученный удар = труднее взять → небольшой дополнительный бонус
-                score = score + math.min(dMult * 0.4, 2.0)
+                score = score + math.min(dMult * 0.35, 1.5)
             end
 
             -- shootPos = с учётом деривации (реальная точка куда направляем мяч)
