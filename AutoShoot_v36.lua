@@ -42,7 +42,7 @@ local AutoShootSpoofPowerType    = "math.huge"
 -- Физика
 local GRAVITY              = 196.2   -- studs/s² (Roblox workspace gravity)
 local AutoShootBallSpeed   = 400     -- Скорость мяча studs/s. Мяч выше цели → увеличь. Мяч ниже → уменьши.
-local AutoShootDragComp    = 1.10    -- k (1/s): экспоненц. затухание v_h=V·e^(-k·t). Не долетает → увеличь. Летит выше → уменьши.
+local AutoShootDragComp    = 1.05    -- k (1/s): экспоненц. затухание v_h=V·e^(-k·t). Не долетает → увеличь. Летит выше → уменьши.
 local FIXED_POWER          = 5.0
 local GK_REACH_RADIUS      = 5.0    -- Радиус статичного покрытия GK (studs)
 local GK_REACH_SPEED       = 12.0   -- Скорость реакции GK для предикта дайва (studs/s)
@@ -450,12 +450,14 @@ local function CalcLaunchDir(startPos, targetPos)
         t = -math.log(1 - kd) / k
     end
 
-    -- Чистая гравитационная компенсация: без ramp, без лишних слагаемых.
-    -- k=1.10 уже корректно учитывает дополнительное сопротивление воздуха через
-    -- время полёта t — чем дальше, тем больше t, тем больше gravComp.
-    local gravComp = 0.5 * GRAVITY * t * t
+    -- gravRamp: плавное нарастание компенсации с дистанцией (откалибровано под игру).
+    -- aeroLoss: эффективный поправочный член, учитывает вертикальное торможение.
+    -- Коэффициент 0.21 (было 0.18) добавляет ~1.5 studs при 200 studs, <0.04 при 80 studs.
+    local gravRamp = 1 - math.exp(-(t / 0.26) ^ 2)
+    local gravComp = 0.5 * GRAVITY * t * t * gravRamp
+    local aeroLoss = 0.21 * k * V * t * t * gravRamp
 
-    local corrY    = targetPos.Y + gravComp
+    local corrY    = targetPos.Y + gravComp + aeroLoss
     local dir      = (Vector3.new(targetPos.X, corrY, targetPos.Z) - startPos).Unit
     local cosAngle = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
 
@@ -687,17 +689,9 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
                 aimPoint = shootPos
             end
 
-            -- На ближних дистанциях реальная вертикальная потеря мала: безопасный потолок сильнее защищаем.
-            local vyAtGoal = AutoShootBallSpeed * launchDir.Y - GRAVITY * flightT
-            if vyAtGoal > 0 then
-                local gravCompHere = 0.5 * GRAVITY * flightT * flightT
-                local aimLocalY    = localY + gravCompHere
-                local safeTop      = GoalHeight - Y_TOP_SAFETY
-                if aimLocalY > safeTop then
-                    local over = aimLocalY - safeTop
-                    score = score - over * over * 8.0 - over * 5.0
-                end
-            end
+            -- Crossbar check удалён: aimLocalY ≠ реальная высота мяча (его пик всегда за воротами).
+            -- Y_TOP_TARGET (1.27 studs) уже гарантирует, что цель ниже перекладины.
+            -- Оставляем мягкий штраф за слишком крутую траекторию (>42°).
 
             -- flightTime уже рассчитан CalcLaunchDir
             local flightTime = flightT
