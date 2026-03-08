@@ -1,5 +1,6 @@
 -- [v36.0] AUTO SHOOT + AUTO PICKUP — Smart GK-aware, zero manual config
 local Players = game:GetService("Players")
+print('9')
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -63,7 +64,7 @@ local Y_TOP_TARGET         = BALL_RADIUS + 0.28   -- 1.45 studs от перек�
 local Y_TOP_SAFETY         = BALL_RADIUS + 0.48   -- 1.65 studs порог штрафа
 local Y_BOT_INSET          = 0.22                 -- studs от пола
 local GOAL_DEPTH_MIN         = 1.0                  -- минимально целимся внутрь ворот
-local GOAL_DEPTH_MAX         = 1.75                 -- максимально целимся вглубь на дальних
+local GOAL_DEPTH_MAX         = 1.55                 -- максимально целимся вглубь на дальних
 local VIS_CURL_MAX           = 1.45                 -- max визуальный боковой Magnus изгиб
 local VIS_CURL_PEAK          = 0.38                 -- пик Magnus-изгиба раньше середины
 local VIS_FALL_EARLY_BIAS    = 0.92                 -- падение начинается чуть раньше, чем симм. дуга
@@ -338,7 +339,7 @@ local function GetEnemyGoalie()
     local goalies = {}
     local halfW = GoalWidth / 2
 
-    local function addGoalie(hrp, name, isNPC)
+    local function addGoalie(hrp, name)
         if not hrp then return end
         local local3 = GoalCFrame:PointToObjectSpace(hrp.Position)
         -- localX: смещение от центра ворот (+ = правая стойка, - = левая)
@@ -350,7 +351,8 @@ local function GetEnemyGoalie()
         local isInGoal = distGoal < 20 and math.abs(localX) < halfW + 3
         table.insert(goalies, {
             hrp = hrp, localX = localX, localY = localY,
-            distGoal = distGoal, name = name, isInGoal = isInGoal, isNPC = isNPC or false
+            distGoal = distGoal, name = name, isInGoal = isInGoal,
+            isNPC = (name == "NPC")
         })
     end
 
@@ -361,7 +363,7 @@ local function GetEnemyGoalie()
                 local hum = char:FindFirstChild("Humanoid")
                 local hrp = char:FindFirstChild("HumanoidRootPart")
                 if hum and hrp and hum.HipHeight >= 4 then
-                    addGoalie(hrp, player.Name, false)
+                    addGoalie(hrp, player.Name)
                 end
             end
         end
@@ -370,7 +372,7 @@ local function GetEnemyGoalie()
     local npcName = myTeam == "Away" and "HomeGoalie" or "Goalie"
     local npc = Workspace:FindFirstChild(npcName)
     if npc and npc:FindFirstChild("HumanoidRootPart") then
-        addGoalie(npc.HumanoidRootPart, "NPC", true)
+        addGoalie(npc.HumanoidRootPart, "NPC")
     end
 
     if #goalies == 0 then
@@ -386,10 +388,8 @@ local function GetEnemyGoalie()
     local best = goalies[1]
     local isAggressive = not best.isInGoal
     if Gui then
-        Gui.GK.Text = string.format("GK: %s%s%s X=%.1f Y=%.1f",
-            best.name,
-            best.isNPC and " [NPC]" or "",
-            isAggressive and " [RUSH]" or "",
+        Gui.GK.Text = string.format("GK: %s%s X=%.1f Y=%.1f",
+            best.name, isAggressive and " [RUSH]" or "",
             best.localX, best.localY)
         Gui.GK.Color = Color3.fromRGB(255, 200, 0)
     end
@@ -412,7 +412,7 @@ local function GetEnemyGoalie()
             best.localX, best.localY, vel.Magnitude)
         Gui.GK.Color = isAggressive and Color3.fromRGB(255,80,0) or Color3.fromRGB(255,200,0)
     end
-    return best.hrp, best.localX, best.localY, isAggressive, vel, best.isNPC
+    return best.hrp, best.localX, best.localY, isAggressive, vel, (best.isNPC or false)
 end
 
 -- ============================================================
@@ -477,9 +477,8 @@ local function CalcLaunchDir(startPos, targetPos)
     local gravRamp = 1 - math.exp(-(t / 0.26) ^ 2)
     local baseComp = (0.5 * GRAVITY + 0.19 * k * V) * t * t * gravRamp
     local t2       = t * t
-    local s        = t2 / (t2 + 0.82 * 0.82)
-    -- Сохраняем более низкую компенсацию на 80-160, но плавно поднимаем very-long shots.
-    local farScale = 0.79 + 0.15 * s + 0.55 * s * s + 0.35 * s * s * s
+    local s        = t2 / (t2 + 0.80 * 0.80)
+    local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.22 * s * s * s
     local upDy     = math.max(targetPos.Y - startPos.Y, 0)
     local nearRise = upDy * 0.78 * math.exp(-(t / 0.34) ^ 2)
     local corrY    = targetPos.Y + baseComp * farScale - nearRise
@@ -531,21 +530,23 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC)
             local playerSideFrac = math.clamp(math.abs(playerLocalX) / math.max(halfW, 0.1), 0, 1)
             local cornerness = math.clamp((math.abs(xf) / math.max(halfW, 0.1) - 0.70) / 0.30, 0, 1)
             local sameSide = ((playerLocalX >= 0 and xf >= 0) or (playerLocalX < 0 and xf < 0)) and 1 or 0
-            local crossSide = 1 - sameSide
             local centerness = 1 - playerSideFrac
+            local shotOpen = math.clamp(math.abs(xf - playerLocalX) / math.max(GoalWidth * 0.95, 0.1), 0, 1)
 
-            -- Чем более закрыт угол по геометрии полёта, тем дальше уходим от штанги.
-            -- По центру и при cross-goal pull сильнее; с той же стороны и под хорошим углом — слабее.
-            local laneTightness = math.clamp(0.62 * centerness + 0.26 * crossSide - 0.10 * sameSide * playerSideFrac, 0, 1)
-            local cornerPull = cornerness * (0.14 + 0.68 * laneTightness)
+            -- Геометрия угла зависит именно от траектории полёта: если до угла "тесно"
+            -- (из центра или с той же стороны рядом со штангой), уходим от штанги сильнее.
+            local laneTightness = cornerness * math.clamp(
+                0.18 + 0.52 * centerness + 0.42 * sameSide * playerSideFrac - 0.62 * shotOpen,
+                0, 1
+            )
+            local cornerPull = cornerness * (0.10 + 0.72 * laneTightness)
             local localX = xf - xSign * cornerPull
 
-            -- Верхние углы дополнительно опускаем при tight lane.
+            -- Верхние tight-angle удары опускаем ниже, чтобы не лизать стойку/перекладину.
             local yRange = math.max(0.5, GoalHeight - Y_TOP_TARGET - Y_BOT_INSET)
             local localY = Y_BOT_INSET + yf * yRange
             local highFrac = math.clamp((yf - 0.60) / 0.40, 0, 1)
-            local tightAngle = cornerness * laneTightness
-            localY = math.max(Y_BOT_INSET, localY - tightAngle * highFrac * 0.50)
+            localY = math.max(Y_BOT_INSET, localY - laneTightness * highFrac * 0.48)
 
             -- 3D позиция цели (idealPos) — точка в плоскости ворот
             local idealPos = GoalCFrame * Vector3.new(localX, localY, 0)
@@ -576,13 +577,6 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC)
             local isTopCorner = (yf >= 0.66) and (math.abs(localX) > halfW * 0.45)
             local isCorner    = math.abs(localX) > halfW * 0.5
             local isLobShot   = (yf >= 0.85)
-
-            -- Для NPC не нужны "обманные" атаки: лучше просто бить в геометрически трудную точку.
-            if gkIsNPC then
-                score = score + math.abs(localX) * 0.7
-                if localY > GoalHeight * 0.52 then score = score + 2.5 end
-                if isCorner then score = score + 2.0 end
-            end
 
             -- Верхние углы: прыжок + смещение = труднее всего
             if isTopCorner then score = score + 9.0 end
@@ -615,7 +609,12 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC)
             -- Дальний угол (противоположный стороне игрока)
             local isFarCorner = (playerLocalX > halfW*0.2 and localX < -halfW*0.4)
                              or (playerLocalX < -halfW*0.2 and localX >  halfW*0.4)
-            if isFarCorner then score = score + 3.5 end
+            if gkIsNPC then
+                -- NPC не нужно "обманывать": просто берём самую трудную открытую точку.
+                score = score + pgkDist2D * 1.35 + math.abs(localX) * 0.35
+            elseif isFarCorner then
+                score = score + 3.5
+            end
 
             -- GK blocking check: всегда проверяем (не только при rush)
             if gkHrp then
@@ -670,27 +669,27 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC)
 
             -- Серверные ограничения для спина:
             -- ниже ~120 studs спин почти не применяется;
-            -- надёжнее в same-side lane; против NPC обманный спин почти не нужен.
-            local sameSideLane = (playerLocalX < -halfW * 0.05 and localX <  halfW * 0.28)
-                              or (playerLocalX >  halfW * 0.05 and localX > -halfW * 0.28)
-            local centerSpinLane = math.abs(localX) < halfW * 0.22 and math.abs(playerLocalX) > halfW * 0.18
-            local canServerSpin = dist > SPIN_SERVER_MIN_DIST and (sameSideLane or centerSpinLane) and not gkIsNPC
+            -- надёжно работает в same-side lane, но не только у самой штанги.
+            local sameSideLane = (playerLocalX < -halfW * 0.04 and localX <  halfW * 0.28)
+                              or (playerLocalX >  halfW * 0.04 and localX > -halfW * 0.28)
+            local canServerSpin = dist > SPIN_SERVER_MIN_DIST and sameSideLane
+            local isCenterCurl  = math.abs(localX) < halfW * 0.22
 
             -- a) GK рядом с целью → огибаем ОТ вратаря
             if canServerSpin and gkDist2D < 5.8 then
                 spinDir = (gkX > localX) and "Right" or "Left"
-                score   = score + 3.6
+                score   = score + 3.4
 
-            -- b) same-side угол при достаточной дистанции: curl into corner
-            elseif canServerSpin and isCorner and sameSideLane then
+            -- b) Новый тип: закрученный удар в центр ворот.
+            -- Держим цель в допустимом same-side коридоре, а curl уводит мяч к центру/от GK.
+            elseif canServerSpin and isCenterCurl then
+                spinDir = (playerLocalX < 0) and "Left" or "Right"
+                score   = score + 2.6
+
+            -- c) same-side угол при достаточной дистанции: curl into corner
+            elseif canServerSpin and isCorner then
                 spinDir = (localX >= 0) and "Left" or "Right"
                 score   = score + 2.9
-
-            -- c) Новый паттерн: закрутка в центр ворот против живого GK,
-            --    если мы стоим с фланга. Для NPC не нужна, т.к они не "читают" удар.
-            elseif canServerSpin and centerSpinLane and pgkDistX < halfW * 0.28 then
-                spinDir = (playerLocalX < 0) and "Left" or "Right"
-                score   = score + 2.4
 
             -- d) Остальные дальние same-side удары: лёгкий спин
             elseif canServerSpin then
