@@ -49,6 +49,7 @@ local GK_REACH_SPEED       = 12.0   -- Скорость реакции GK для
 local PAST_GOAL_BASE       = 45     -- Базовое расширение цели (studs) для всех ударов
 local PAST_GOAL_CLOSE      = 70     -- Доп. расширение для ближних (<SPIN_TRICK_DIST) ударов
 local SPIN_TRICK_DIST      = 72     -- Граница "близкой" дистанции
+local MIN_SPIN_FAR_DIST    = 120    -- сервер не принимает спин в диапазоне [72, 120)
 local AutoShootDerivMult   = 4.5    -- studs деривации при d=100. Мяч улетает меньше → увеличь.
 local BALL_RADIUS           = 1.168  -- радиус мяча: 2.336 / 2 studs
 -- Безопасный отступ = радиус мяча + небольшой запас чтобы мяч не касался штанги
@@ -467,11 +468,10 @@ local function CalcLaunchDir(startPos, targetPos)
     end
 
     -- Откалиброванная формула. Работает верно на 80-180 studs.
-    -- aeroLoss 0.19 (вместо 0.18) добавляет ровно ~0.4 stud при 200 studs,
-    -- менее 0.01 при 80 studs — мяч доходит до цели на дальних без перелёта на ближних.
+    -- Откалиброванная формула (0.18 = правильное значение для 80-180 studs).
     local gravRamp = 1 - math.exp(-(t / 0.26) ^ 2)
     local gravComp = 0.5 * GRAVITY * t * t * gravRamp
-    local aeroLoss = 0.19 * k * V * t * t * gravRamp
+    local aeroLoss = 0.18 * k * V * t * t * gravRamp
     local corrY    = targetPos.Y + gravComp + aeroLoss
     local dir      = (Vector3.new(targetPos.X, corrY, targetPos.Z) - startPos).Unit
     local cosAngle = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
@@ -632,29 +632,39 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             -- ПРАВИЛО ИГРЫ (инверсия): "Right" label → мяч ВЛЕВО, "Left" label → мяч ВПРАВО.
             -- Деривация всегда компенсирует снос: "Right"→+dMult, "Left"→−dMult.
             --
-            -- Причина старых багов: условия b и c добавляли спин при dist < SPIN_TRICK_DIST,
-            -- где velMult ≈ 3×. Реальный снос сервером ≈ 3× больше нашего dMult → мяч
-            -- вылетал за ворота, что выглядело как "реверсия". Поэтому только v36_9-условия:
             local spinDir = "None"
 
-            -- a) GK рядом с целью → огибаем ОТ вратаря
-            if dist > 58 and gkDist2D < 5.5 then
-                spinDir = (gkX > localX) and "Right" or "Left"
-                score   = score + 3.0
+            -- Сервер принимает спин только в двух диапазонах:
+            --   dist < SPIN_TRICK_DIST (72): PAST_GOAL_CLOSE даёт effective >= 187 studs ✓
+            --   dist >= MIN_SPIN_FAR_DIST (120): effective = dist+45 >= 165 studs ✓
+            --   dist 72-119: effective 117-164 → сервер ИГНОРИРУЕТ спин ✗
+            local spinOk = (dist < SPIN_TRICK_DIST) or (dist >= MIN_SPIN_FAR_DIST)
 
-            -- b) Угол при dist > SPIN_TRICK_DIST (velMult ≈ 1.5×): curl INTO corner
-            elseif dist > SPIN_TRICK_DIST and isCorner then
-                spinDir = (localX >= 0) and "Left" or "Right"
-                score   = score + 2.0
+            -- Если игрок на ПРОТИВОПОЛОЖНОЙ стороне от цели — угол подхода неверный,
+            -- сервер тоже не принимает такой спин (подтверждено пользователем).
+            local spinAngleOk = not ((playerLocalX < -halfW*0.25 and localX >  halfW*0.30)
+                                  or (playerLocalX >  halfW*0.25 and localX < -halfW*0.30))
 
-            -- c) Любая дальняя цель > SPIN_TRICK_DIST: лёгкий спин в сторону цели
-            elseif dist > SPIN_TRICK_DIST then
-                local goalDir  = (GoalCFrame.Position - startPos).Unit
-                local fwdDir   = HumanoidRootPart.CFrame.LookVector
-                local fwdAngle = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
-                if fwdAngle < 35 then
-                    spinDir = localX >= 0 and "Left" or "Right"
-                    score   = score + 1.5
+            if spinOk and spinAngleOk then
+                -- a) GK рядом с целью (работает в обоих диапазонах)
+                if gkDist2D < 5.0 then
+                    spinDir = (gkX > localX) and "Right" or "Left"
+                    score   = score + 3.0
+
+                -- b) Угол, дальние (>= 120): curl INTO corner
+                elseif dist >= MIN_SPIN_FAR_DIST and isCorner then
+                    spinDir = (localX >= 0) and "Left" or "Right"
+                    score   = score + 2.0
+
+                -- c) Любая дальняя цель >= 120
+                elseif dist >= MIN_SPIN_FAR_DIST then
+                    local goalDir  = (GoalCFrame.Position - startPos).Unit
+                    local fwdDir   = HumanoidRootPart.CFrame.LookVector
+                    local fwdAngle = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
+                    if fwdAngle < 35 then
+                        spinDir = localX >= 0 and "Left" or "Right"
+                        score   = score + 1.5
+                    end
                 end
             end
 
@@ -675,12 +685,10 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             local depthAlpha  = 1 - math.exp(-dist / 95)
             local goalDepth   = GOAL_DEPTH_MIN + (GOAL_DEPTH_MAX - GOAL_DEPTH_MIN) * depthAlpha
             if spinDir ~= "None" then
-                goalDepth = goalDepth + 2.5  -- глубже → сервер видит бо́льшую дистанцию → применяет спин
-                -- Защита от перелёта: спин иногда добавляет высоту на 90-160 studs,
-                -- поэтому слегка штрафуем самые верхние цели с активным спином.
-                local spinHeightPenalty = (localY / math.max(GoalHeight,1)) > 0.80
-                                        and dist > 90 and dist < 170
-                if spinHeightPenalty then score = score - 3.5 end
+                goalDepth = goalDepth + 0.4  -- небольшая доп. глубина для регистрации сервером
+                -- Спин иногда добавляет вертикальный дрейф → штрафуем самые верхние цели
+                local spinHi = (localY / math.max(GoalHeight,1)) > 0.74
+                if spinHi then score = score - 4.5 end
             end
             if isLobShot then goalDepth = goalDepth + 0.45 end
             local shootPos    = GoalCFrame * Vector3.new(shootLocalX, localY, -goalDepth)
