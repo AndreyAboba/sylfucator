@@ -63,7 +63,7 @@ local Y_TOP_TARGET         = BALL_RADIUS + 0.28   -- 1.45 studs от перек�
 local Y_TOP_SAFETY         = BALL_RADIUS + 0.48   -- 1.65 studs порог штрафа
 local Y_BOT_INSET          = 0.22                 -- studs от пола
 local GOAL_DEPTH_MIN         = 1.0                  -- минимально целимся внутрь ворот
-local GOAL_DEPTH_MAX         = 2.4                  -- максимально целимся вглубь на дальних
+local GOAL_DEPTH_MAX         = 2.1                  -- максимально целимся вглубь на дальних
 local VIS_CURL_MAX           = 1.45                 -- max визуальный боковой Magnus изгиб
 local VIS_CURL_PEAK          = 0.38                 -- пик Magnus-изгиба раньше середины
 local VIS_FALL_EARLY_BIAS    = 0.92                 -- падение начинается чуть раньше, чем симм. дуга
@@ -474,7 +474,8 @@ local function CalcLaunchDir(startPos, targetPos)
     local gravRamp = 1 - math.exp(-(t / 0.26) ^ 2)
     local baseComp = (0.5 * GRAVITY + 0.19 * k * V) * t * t * gravRamp
     local t2       = t * t
-    local compScale= 0.85 + 0.40 * (t2 / (t2 + 0.60 * 0.60))
+    local s        = t2 / (t2 + 0.72 * 0.72)
+    local compScale= 0.82 + 0.18 * s + 0.55 * s * s
     local corrY    = targetPos.Y + baseComp * compScale
     local dir      = (Vector3.new(targetPos.X, corrY, targetPos.Z) - startPos).Unit
     local cosAngle = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
@@ -521,16 +522,25 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
     for _, xf in ipairs(xPoints) do
         for _, yf in ipairs(yFracs) do
             local xSign = (xf >= 0) and 1 or -1
+            local playerSideFrac = math.clamp(math.abs(playerLocalX) / math.max(halfW, 0.1), 0, 1)
             local cornerness = math.clamp((math.abs(xf) / math.max(halfW, 0.1) - 0.70) / 0.30, 0, 1)
             local sameSide = ((playerLocalX >= 0 and xf >= 0) or (playerLocalX < 0 and xf < 0)) and 1 or 0
-            local playerSideFrac = math.clamp(math.abs(playerLocalX) / math.max(halfW, 0.1), 0, 1)
-            -- Чем острее угол (игрок и угол на одной стороне), тем сильнее уходим от штанги.
-            local cornerPull = cornerness * (0.34 + 0.78 * sameSide * playerSideFrac)
+            local crossSide = 1 - sameSide
+            local centerness = 1 - playerSideFrac
+
+            -- Чем более закрыт угол по геометрии полёта, тем дальше уходим от штанги.
+            -- По центру и при cross-goal pull сильнее; с той же стороны и под хорошим углом — слабее.
+            local cornerPull = cornerness * math.max(0,
+                0.18 + 0.40 * centerness + 0.34 * crossSide - 0.14 * sameSide * playerSideFrac
+            )
             local localX = xf - xSign * cornerPull
-            -- Цель с учётом вертикального инсета: центр мяча никогда не доходит
-            -- до перекладины или пола ближе чем на радиус мяча + запас точности.
+
+            -- Верхние углы дополнительно опускаем при "tight angle", чтобы мяч не лизал перекладину.
             local yRange = math.max(0.5, GoalHeight - Y_TOP_TARGET - Y_BOT_INSET)
-            local localY = Y_BOT_INSET + yf * yRange  -- гарантированно внутри ворот
+            local localY = Y_BOT_INSET + yf * yRange
+            local highFrac = math.clamp((yf - 0.60) / 0.40, 0, 1)
+            local tightAngle = cornerness * (0.38 * centerness + 0.28 * crossSide)
+            localY = math.max(Y_BOT_INSET, localY - tightAngle * highFrac * 0.42)
 
             -- 3D позиция цели (idealPos) — точка в плоскости ворот
             local idealPos = GoalCFrame * Vector3.new(localX, localY, 0)
@@ -647,31 +657,30 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             local spinDir = "None"
 
             -- Серверные ограничения для спина:
-            -- 1) ниже ~120 studs спин почти не применяется;
-            -- 2) надёжнее всего сервер принимает спин в "same-side lane":
-            --    если стоим слева, крутим в левую половину; если справа — в правую.
-            local sameSideLane = (playerLocalX < 0 and localX <=  halfW * 0.10)
-                              or (playerLocalX >= 0 and localX >= -halfW * 0.10)
+            -- ниже ~120 studs спин почти не применяется;
+            -- надёжно работает в same-side lane: если стоим слева, крутим в левую часть, и наоборот.
+            local sameSideLane = (playerLocalX < -halfW * 0.10 and localX < -halfW * 0.02)
+                              or (playerLocalX >  halfW * 0.10 and localX >  halfW * 0.02)
             local canServerSpin = dist > SPIN_SERVER_MIN_DIST and sameSideLane
 
-            -- a) GK рядом с целью → огибаем ОТ вратаря, но только там где сервер принимает спин
-            if canServerSpin and gkDist2D < 5.5 then
+            -- a) GK рядом с целью → огибаем ОТ вратаря
+            if canServerSpin and gkDist2D < 5.8 then
                 spinDir = (gkX > localX) and "Right" or "Left"
-                score   = score + 2.8
+                score   = score + 3.4
 
-            -- b) Угол при достаточной дистанции: curl into corner, но внутри same-side lane
+            -- b) same-side угол при достаточной дистанции: curl into corner
             elseif canServerSpin and isCorner then
                 spinDir = (localX >= 0) and "Left" or "Right"
-                score   = score + 1.8
+                score   = score + 2.8
 
-            -- c) Остальные дальние удары: лёгкий спин только если сервер вероятно примет его
+            -- c) Остальные дальние same-side удары: лёгкий спин
             elseif canServerSpin then
                 local goalDir  = (GoalCFrame.Position - startPos).Unit
                 local fwdDir   = HumanoidRootPart.CFrame.LookVector
                 local fwdAngle = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
-                if fwdAngle < 35 then
+                if fwdAngle < 38 then
                     spinDir = localX >= 0 and "Left" or "Right"
-                    score   = score + 1.2
+                    score   = score + 1.7
                 end
             end
 
