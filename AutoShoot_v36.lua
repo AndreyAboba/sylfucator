@@ -84,6 +84,10 @@ local AutoPickupEnabled    = true
 local AutoPickupDist       = 180
 local AutoPickupSpoofValue = 2.8
 local AutoPickupStatus     = { Running = false, Connection = nil }
+local AutoShootShowTrajectory = true
+local AutoShootShow3DBoxes    = true
+local AutoShootTrajectoryColor = Color3.fromRGB(255, 165, 0)
+local AutoShootBoxesColor      = Color3.fromRGB(255, 90, 90)
 
 -- ============================================================
 -- GUI
@@ -118,6 +122,35 @@ local TargetCube, GoalCube, NoSpinCube = {}, {}, {}
 local TRAJ_SEGMENTS = 20               -- кол-во сегментов дуги траектории
 local TrajectoryLines = {}             -- оранжевая пунктирная дуга
 local PeakCube = {}                    -- жёлтый бокс: пик траектории
+local StartCircle = nil                -- круг старта траектории
+local function ApplyVisualStyles()
+    for _, l in ipairs(TrajectoryLines) do
+        l.Color        = AutoShootTrajectoryColor
+        l.Thickness    = 1.5
+        l.Transparency = 0.55
+        l.ZIndex       = 999
+    end
+    local function SC(cube, th)
+        for _, l in ipairs(cube) do
+            l.Color = AutoShootBoxesColor
+            l.Thickness = th
+            l.Transparency = 0.82
+            l.ZIndex = 1000
+        end
+    end
+    SC(TargetCube, 3)
+    SC(GoalCube,   3)
+    SC(NoSpinCube, 2)
+    SC(PeakCube,   2)
+    if StartCircle then
+        StartCircle.Color = AutoShootTrajectoryColor
+        StartCircle.Thickness = 1
+        StartCircle.Transparency = 0.75
+        StartCircle.Filled = false
+        StartCircle.NumSides = 24
+        StartCircle.Visible = false
+    end
+end
 local function InitializeCubes()
     for i = 1, 12 do
         if TargetCube[i] and TargetCube[i].Remove then TargetCube[i]:Remove() end
@@ -129,33 +162,33 @@ local function InitializeCubes()
         NoSpinCube[i] = Drawing.new("Line")
         PeakCube[i]   = Drawing.new("Line")
     end
-    -- Траектория: TRAJ_SEGMENTS линий
     for i = 1, TRAJ_SEGMENTS do
         if TrajectoryLines[i] and TrajectoryLines[i].Remove then TrajectoryLines[i]:Remove() end
         TrajectoryLines[i] = Drawing.new("Line")
-        TrajectoryLines[i].Color        = Color3.fromRGB(255, 165, 0)  -- оранжевый
-        TrajectoryLines[i].Thickness    = 2
-        TrajectoryLines[i].Transparency = 0.4
-        TrajectoryLines[i].ZIndex       = 999
-        TrajectoryLines[i].Visible      = false
+        TrajectoryLines[i].Visible = false
     end
-    local function SC(cube, color, th)
-        for _, l in ipairs(cube) do
-            l.Color = color; l.Thickness = th or 2
-            l.Transparency = 0.7; l.ZIndex = 1000; l.Visible = false
-        end
-    end
-    SC(TargetCube, Color3.fromRGB(0,255,0),   5)   -- 🟢 зелёный = AimPoint (куда направлен ствол)
-    SC(GoalCube,   Color3.fromRGB(255,0,0),   5)   -- 🔴 красный = PredictedLand (куда УПАДЁТ мяч)
-    SC(NoSpinCube, Color3.fromRGB(0,200,255), 3)   -- 🔵 голубой = габарит ворот
-    SC(PeakCube,   Color3.fromRGB(255,255,0), 4)   -- 🟡 жёлтый = пик дуги
+    if StartCircle and StartCircle.Remove then StartCircle:Remove() end
+    StartCircle = Drawing.new("Circle")
+    ApplyVisualStyles()
 end
 
 -- DrawTrajectory: кубический Безье с боковым смещением для Магнус-эффекта.
 -- P0=start, P3=land (красный куб), P1/P2 = управляющие точки для подъёма + Magnus curl.
 local function DrawTrajectory(startPos, peakPos, endPos, peakFrac, spinStr)
-    if not peakPos or not endPos then
-        for _, l in ipairs(TrajectoryLines) do l.Visible = false end; return
+    if not AutoShootShowTrajectory or not peakPos or not endPos then
+        for _, l in ipairs(TrajectoryLines) do l.Visible = false end
+        if StartCircle then StartCircle.Visible = false end
+        return
+    end
+    local ss, sv = Camera:WorldToViewportPoint(startPos)
+    if StartCircle then
+        if sv and ss.Z > 0 then
+            StartCircle.Position = Vector2.new(ss.X, ss.Y)
+            StartCircle.Radius = math.clamp(140 / math.max(ss.Z, 8), 3, 10)
+            StartCircle.Visible = true
+        else
+            StartCircle.Visible = false
+        end
     end
 
     -- Горизонтальные направления
@@ -507,10 +540,11 @@ local function CalcLaunchDir(startPos, targetPos)
     local baseComp = (0.5 * GRAVITY + 0.19 * k * V) * t * t * gravRamp
     local t2       = t * t
     local s        = t2 / (t2 + 0.80 * 0.80)
-    local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.62 * s * s * s
+    local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.60 * s * s * s
     local upDy     = math.max(targetPos.Y - startPos.Y, 0)
     local nearRise = upDy * 0.68 * math.exp(-(t / 0.34) ^ 2)
-    local corrY    = targetPos.Y + baseComp * farScale - nearRise
+    local midDrop  = 0.16 * math.exp(-((t - 0.43) / 0.11) ^ 2)
+    local corrY    = targetPos.Y + baseComp * farScale - nearRise - midDrop
     local dir      = (Vector3.new(targetPos.X, corrY, targetPos.Z) - startPos).Unit
     local cosAngle = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
 
@@ -573,16 +607,16 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
                 0, 1
             )
             local sameSideNarrow = cornerness * math.max(0, sameSide * playerSideFrac * (shotOpen - 0.38)) * 0.18
-            local distTightBoost = cornerness * math.clamp((dist - 150) / 120, 0, 1) * (0.10 + 0.22 * centerness + 0.16 * sameSide * playerSideFrac)
-            local longCornerInset = cornerness * math.clamp((dist - 175) / 115, 0, 1) * (0.16 + 0.18 * (1 - shotOpen) + 0.12 * centerness)
-            local cornerPull = math.max(0, cornerness * (0.14 + 0.82 * laneTightness) + distTightBoost + longCornerInset - sameSideNarrow)
+            local distTightBoost = cornerness * math.clamp((dist - 145) / 135, 0, 1) * (0.12 + 0.24 * centerness + 0.18 * sameSide * playerSideFrac)
+            local longCornerInset = cornerness * math.clamp((dist - 140) / 160, 0, 1) * (0.24 + 0.24 * (1 - shotOpen) + 0.16 * centerness)
+            local cornerPull = math.max(0, cornerness * (0.16 + 0.88 * laneTightness) + distTightBoost + longCornerInset - sameSideNarrow)
             local localX = xf - xSign * cornerPull
 
             -- Верхние tight-angle удары опускаем ниже, чтобы не лизать стойку/перекладину.
             local yRange = math.max(0.5, GoalHeight - Y_TOP_TARGET - Y_BOT_INSET)
             local localY = Y_BOT_INSET + yf * yRange
             local highFrac = math.clamp((yf - 0.60) / 0.40, 0, 1)
-            local localY = math.max(Y_BOT_INSET, localY - (laneTightness + distTightBoost + longCornerInset * 0.55) * highFrac * 0.54)
+            local localY = math.max(Y_BOT_INSET, localY - (laneTightness + distTightBoost + longCornerInset * 0.65) * highFrac * 0.56)
 
             -- 3D позиция цели (idealPos) — точка в плоскости ворот
             local idealPos = GoalCFrame * Vector3.new(localX, localY, 0)
@@ -1278,33 +1312,32 @@ AutoShoot.Start = function()
             for _, l in ipairs(TrajectoryLines) do l.Visible = false end
         end
 
-        -- 🟢 Зелёный = AimPoint (куда смотрит ствол с поправкой на гравитацию)
-        if AimPoint then
-            DrawOrientedCube(TargetCube, CFrame.new(AimPoint), Vector3.new(2,2,2))
+        if AutoShootShow3DBoxes then
+            if AimPoint then
+                DrawOrientedCube(TargetCube, CFrame.new(AimPoint), Vector3.new(2,2,2))
+            else
+                for _, l in ipairs(TargetCube) do l.Visible = false end
+            end
+            if PredictedLand then
+                DrawOrientedCube(GoalCube, CFrame.new(PredictedLand), Vector3.new(2.5,2.5,2.5))
+            else
+                for _, l in ipairs(GoalCube) do l.Visible = false end
+            end
+            if CurrentPeakPos and hasTarget then
+                DrawOrientedCube(PeakCube, CFrame.new(CurrentPeakPos), Vector3.new(2,2,2))
+            else
+                for _, l in ipairs(PeakCube) do l.Visible = false end
+            end
+            if GoalCFrame and width and GoalHeight then
+                DrawOrientedCube(NoSpinCube, GoalCFrame * CFrame.new(0, GoalHeight/2, 0),
+                    Vector3.new(width, GoalHeight, 1))
+            else
+                for _, l in ipairs(NoSpinCube) do l.Visible = false end
+            end
         else
-            for _, l in ipairs(TargetCube) do l.Visible = false end
-        end
-
-        -- 🔴 Красный = PredictedLand (куда мяч прилетит — предикция траектории)
-        if PredictedLand then
-            DrawOrientedCube(GoalCube, CFrame.new(PredictedLand), Vector3.new(2.5,2.5,2.5))
-        else
-            for _, l in ipairs(GoalCube) do l.Visible = false end
-        end
-
-        -- 🟡 Жёлтый = пик дуги (наивысшая точка полёта)
-        if CurrentPeakPos and hasTarget then
-            DrawOrientedCube(PeakCube, CFrame.new(CurrentPeakPos), Vector3.new(2,2,2))
-        else
-            for _, l in ipairs(PeakCube) do l.Visible = false end
-        end
-
-        -- 🔵 Голубой = реальный габарит ворот (W × H)
-        if GoalCFrame and width and GoalHeight then
-            DrawOrientedCube(NoSpinCube, GoalCFrame * CFrame.new(0, GoalHeight/2, 0),
-                Vector3.new(width, GoalHeight, 1))
-        else
-            for _, l in ipairs(NoSpinCube) do l.Visible = false end
+            for _, cube in ipairs({TargetCube, GoalCube, PeakCube, NoSpinCube}) do
+                for _, l in ipairs(cube) do l.Visible = false end
+            end
         end
     end)
 end
@@ -1324,6 +1357,7 @@ AutoShoot.Stop = function()
     for i = 1, TRAJ_SEGMENTS do
         if TrajectoryLines[i] and TrajectoryLines[i].Remove then TrajectoryLines[i]:Remove() end
     end
+    if StartCircle and StartCircle.Remove then StartCircle:Remove(); StartCircle = nil end
     if AutoShootStatus.ButtonGui then AutoShootStatus.ButtonGui:Destroy(); AutoShootStatus.ButtonGui = nil end
 end
 
@@ -1331,15 +1365,22 @@ AutoShoot.SetDebugText = function(v)
     AutoShootDebugText = v; ToggleDebugText(v)
 end
 
+local function IsLocalPlayerGoalie()
+    local wModel = Workspace:FindFirstChild(LocalPlayer.Name)
+    if wModel and wModel:FindFirstChild("Hitbox") then return true end
+    if Character and Character:FindFirstChild("Hitbox") then return true end
+    return false
+end
+
 -- ============================================================
 -- AUTO PICKUP
 -- ============================================================
 local AutoPickup = {}
 AutoPickup.Start = function()
-    if AutoPickupStatus.Running then return end
+    if AutoPickupStatus.Connection then AutoPickupStatus.Connection:Disconnect(); AutoPickupStatus.Connection = nil end
     AutoPickupStatus.Running = true
     AutoPickupStatus.Connection = RunService.Heartbeat:Connect(function()
-        if not AutoPickupEnabled or not PickupRemote then return end
+        if not AutoPickupEnabled or not PickupRemote or IsLocalPlayerGoalie() then return end
         local ball = Workspace:FindFirstChild("ball")
         if not ball or ball:FindFirstChild("playerWeld") then return end
         if (HumanoidRootPart.Position - ball.Position).Magnitude <= AutoPickupDist then
@@ -1441,6 +1482,29 @@ local function SetupUI(UI)
             Callback = function(v) AutoShootSpoofPowerType = v end
         }, "AutoShootSpoofType")
 
+        uiElements.AutoShootShowTrajectory = UI.Sections.AutoShoot:Toggle({
+            Name = "Show Trajectory", Default = AutoShootShowTrajectory,
+            Callback = function(v) AutoShootShowTrajectory = v end
+        }, "AutoShootShowTrajectory")
+
+        uiElements.AutoShootShow3DBoxes = UI.Sections.AutoShoot:Toggle({
+            Name = "Show 3D Boxes", Default = AutoShootShow3DBoxes,
+            Callback = function(v) AutoShootShow3DBoxes = v end
+        }, "AutoShootShow3DBoxes")
+
+        pcall(function()
+            uiElements.AutoShootTrajectoryColor = UI.Sections.AutoShoot:Colorpicker({
+                Name = "Trajectory Color", Default = AutoShootTrajectoryColor,
+                Callback = function(v) AutoShootTrajectoryColor = v; ApplyVisualStyles() end
+            }, "AutoShootTrajectoryColor")
+        end)
+        pcall(function()
+            uiElements.AutoShootBoxesColor = UI.Sections.AutoShoot:Colorpicker({
+                Name = "3D Boxes Color", Default = AutoShootBoxesColor,
+                Callback = function(v) AutoShootBoxesColor = v; ApplyVisualStyles() end
+            }, "AutoShootBoxesColor")
+        end)
+
         uiElements.AutoShootDebugText = UI.Sections.AutoShoot:Toggle({
             Name = "Debug Text", Default = AutoShootDebugText,
             Callback = function(v) AutoShoot.SetDebugText(v) end
@@ -1479,6 +1543,7 @@ local AutoShootModule = {}
 function AutoShootModule.Init(UI, coreParam, notifyFunc)
     local notify = notifyFunc or function(t,m) print("["..t.."]: "..m) end
     SetupUI(UI)
+    if AutoPickupEnabled then AutoPickup.Start() end
 
     LocalPlayer.CharacterAdded:Connect(function(newChar)
         task.wait(1)
