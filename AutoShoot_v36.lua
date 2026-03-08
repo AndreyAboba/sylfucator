@@ -500,7 +500,7 @@ local function CalcLaunchDir(startPos, targetPos)
     local baseComp = (0.5 * GRAVITY + 0.19 * k * V) * t * t * gravRamp
     local t2       = t * t
     local s        = t2 / (t2 + 0.80 * 0.80)
-    local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.46 * s * s * s
+    local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.50 * s * s * s
     local upDy     = math.max(targetPos.Y - startPos.Y, 0)
     local nearRise = upDy * 0.78 * math.exp(-(t / 0.34) ^ 2)
     local corrY    = targetPos.Y + baseComp * farScale - nearRise
@@ -637,8 +637,10 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             local isFarCorner = (playerLocalX > halfW*0.2 and localX < -halfW*0.4)
                              or (playerLocalX < -halfW*0.2 and localX >  halfW*0.4)
             if gkIsNPC then
-                -- NPC не нужно "обманывать": просто бьём в сложную открытую точку.
-                score = score + pgkDist2D * 1.35 + math.abs(localX) * 0.35
+                -- NPC не нужно обманывать спином: просто бьём в самые трудные не-spin точки.
+                score = score + pgkDist2D * 1.55 + math.abs(localX) * 0.45
+                if isTopCorner then score = score + 2.5 end
+                if isCorner then score = score + 1.3 end
             else
                 if isFarCorner then score = score + 3.5 end
                 -- Паттерны вратаря: если он системно сидит с одной стороны или смещается,
@@ -708,35 +710,35 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             -- Серверные ограничения для спина:
             -- ниже ~120 studs спин почти не применяется;
             -- надёжно работает в same-side lane, но не только у самой штанги.
-            local sameSideLane = (playerLocalX < -halfW * 0.03 and localX <  halfW * 0.34)
-                              or (playerLocalX >  halfW * 0.03 and localX > -halfW * 0.34)
-            local canServerSpin = dist > SPIN_SERVER_MIN_DIST and sameSideLane
+            local sameSideLane = (playerLocalX < 0 and localX < 0) or (playerLocalX > 0 and localX > 0)
+            local crossLaneOpen = math.abs(localX - playerLocalX) / math.max(halfW, 0.1)
+            local canServerSpin = (not gkIsNPC) and dist > SPIN_SERVER_MIN_DIST
             local isCenterCurl  = math.abs(localX) < halfW * 0.30
                                and (math.abs(gkX) > halfW * 0.14 or math.abs(gkBiasX) > halfW * 0.12)
 
             -- a) GK рядом с целью → огибаем ОТ вратаря
             if canServerSpin and gkDist2D < 5.8 then
                 spinDir = (gkX > localX) and "Right" or "Left"
-                score   = score + 3.6
+                score   = score + 3.4 + (sameSideLane and 0.8 or 0.0)
 
             -- b) Новый тип: закрученный фейк в центр ворот.
             elseif canServerSpin and isCenterCurl then
                 spinDir = (playerLocalX < 0) and "Left" or "Right"
-                score   = score + 4.4
+                score   = score + 4.8 + (sameSideLane and 0.5 or 0.0)
 
-            -- c) same-side угол при достаточной дистанции: curl into corner
+            -- c) Угловой spin: same-side надёжнее, но cross-side тоже возможен если коридор открыт.
             elseif canServerSpin and isCorner then
                 spinDir = (localX >= 0) and "Left" or "Right"
-                score   = score + 3.2
+                score   = score + 2.4 + (sameSideLane and 1.0 or math.min(crossLaneOpen, 1) * 0.9)
 
-            -- d) Остальные дальние same-side удары: лёгкий спин
+            -- d) Остальные дальние spin-удары
             elseif canServerSpin then
                 local goalDir  = (GoalCFrame.Position - startPos).Unit
                 local fwdDir   = HumanoidRootPart.CFrame.LookVector
                 local fwdAngle = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
                 if fwdAngle < 42 then
                     spinDir = localX >= 0 and "Left" or "Right"
-                    score   = score + 2.1
+                    score   = score + 1.8 + (sameSideLane and 0.6 or 0.0)
                 end
             end
 
@@ -756,8 +758,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             -- Закрученные удары в игре приходят чуть ВЫШЕ ожидаемого, поэтому физически целимся немного ниже.
             if spinDir ~= "None" then
                 local hFrac = localY / math.max(GoalHeight, 1)
-                local dFrac = dist / (dist + 120)
-                local spinDrop = 0.14 + 0.30 * hFrac + 0.08 * dFrac
+                local spinDrop = 0.18 + 0.34 * hFrac
                 shootLocalY = math.max(Y_BOT_INSET, localY - spinDrop)
             end
 
@@ -766,7 +767,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             local depthAlpha  = 1 - math.exp(-dist / 95)
             local goalDepth   = GOAL_DEPTH_MIN + (GOAL_DEPTH_MAX - GOAL_DEPTH_MIN) * depthAlpha
             if spinDir ~= "None" then
-                goalDepth = goalDepth + 1.35
+                goalDepth = goalDepth + 0.90
             end
             if isLobShot then goalDepth = goalDepth + 0.45 end
             local shootPos    = GoalCFrame * Vector3.new(shootLocalX, shootLocalY, -goalDepth)
