@@ -468,13 +468,14 @@ local function CalcLaunchDir(startPos, targetPos)
         t = -math.log(1 - kd) / k
     end
 
-    -- Откалиброванная формула. Работает верно на 80-180 studs.
-    -- aeroLoss 0.19 (вместо 0.18) добавляет ровно ~0.4 stud при 200 studs,
-    -- менее 0.01 при 80 studs — мяч доходит до цели на дальних без перелёта на ближних.
+    -- Непрерывная перенастройка компенсации по времени полёта без порогов по distance.
+    -- short/medium: чуть МЕНЬШЕ компенсации (80-100 studs не лизали перекладину),
+    -- very long: чуть БОЛЬШЕ компенсации (210-300 studs приходили выше).
     local gravRamp = 1 - math.exp(-(t / 0.26) ^ 2)
-    local gravComp = 0.5 * GRAVITY * t * t * gravRamp
-    local aeroLoss = 0.19 * k * V * t * t * gravRamp
-    local corrY    = targetPos.Y + gravComp + aeroLoss
+    local baseComp = (0.5 * GRAVITY + 0.19 * k * V) * t * t * gravRamp
+    local t2       = t * t
+    local compScale= 0.85 + 0.40 * (t2 / (t2 + 0.60 * 0.60))
+    local corrY    = targetPos.Y + baseComp * compScale
     local dir      = (Vector3.new(targetPos.X, corrY, targetPos.Z) - startPos).Unit
     local cosAngle = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
 
@@ -524,7 +525,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             local sameSide = ((playerLocalX >= 0 and xf >= 0) or (playerLocalX < 0 and xf < 0)) and 1 or 0
             local playerSideFrac = math.clamp(math.abs(playerLocalX) / math.max(halfW, 0.1), 0, 1)
             -- Чем острее угол (игрок и угол на одной стороне), тем сильнее уходим от штанги.
-            local cornerPull = cornerness * (0.28 + 0.62 * sameSide * playerSideFrac)
+            local cornerPull = cornerness * (0.34 + 0.78 * sameSide * playerSideFrac)
             local localX = xf - xSign * cornerPull
             -- Цель с учётом вертикального инсета: центр мяча никогда не доходит
             -- до перекладины или пола ближе чем на радиус мяча + запас точности.
@@ -647,22 +648,24 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
 
             -- Серверные ограничения для спина:
             -- 1) ниже ~120 studs спин почти не применяется;
-            -- 2) cross-goal спин (игрок слева -> правая цель и наоборот) часто игнорируется сервером.
-            local wantsCrossGoal = (playerLocalX < -halfW * SPIN_CROSS_BLOCK_X and localX >  halfW * SPIN_CROSS_BLOCK_X)
-                                or (playerLocalX >  halfW * SPIN_CROSS_BLOCK_X and localX < -halfW * SPIN_CROSS_BLOCK_X)
+            -- 2) надёжнее всего сервер принимает спин в "same-side lane":
+            --    если стоим слева, крутим в левую половину; если справа — в правую.
+            local sameSideLane = (playerLocalX < 0 and localX <=  halfW * 0.10)
+                              or (playerLocalX >= 0 and localX >= -halfW * 0.10)
+            local canServerSpin = dist > SPIN_SERVER_MIN_DIST and sameSideLane
 
             -- a) GK рядом с целью → огибаем ОТ вратаря, но только там где сервер принимает спин
-            if dist > SPIN_SERVER_MIN_DIST and not wantsCrossGoal and gkDist2D < 5.5 then
+            if canServerSpin and gkDist2D < 5.5 then
                 spinDir = (gkX > localX) and "Right" or "Left"
                 score   = score + 2.8
 
-            -- b) Угол при достаточной дистанции: curl into corner
-            elseif dist > SPIN_SERVER_MIN_DIST and not wantsCrossGoal and isCorner then
+            -- b) Угол при достаточной дистанции: curl into corner, но внутри same-side lane
+            elseif canServerSpin and isCorner then
                 spinDir = (localX >= 0) and "Left" or "Right"
                 score   = score + 1.8
 
             -- c) Остальные дальние удары: лёгкий спин только если сервер вероятно примет его
-            elseif dist > SPIN_SERVER_MIN_DIST and not wantsCrossGoal then
+            elseif canServerSpin then
                 local goalDir  = (GoalCFrame.Position - startPos).Unit
                 local fwdDir   = HumanoidRootPart.CFrame.LookVector
                 local fwdAngle = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
