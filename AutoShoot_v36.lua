@@ -574,14 +574,15 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             )
             local sameSideNarrow = cornerness * math.max(0, sameSide * playerSideFrac * (shotOpen - 0.38)) * 0.18
             local distTightBoost = cornerness * math.clamp((dist - 150) / 120, 0, 1) * (0.10 + 0.22 * centerness + 0.16 * sameSide * playerSideFrac)
-            local cornerPull = math.max(0, cornerness * (0.14 + 0.82 * laneTightness) + distTightBoost - sameSideNarrow)
+            local longCornerInset = cornerness * math.clamp((dist - 175) / 115, 0, 1) * (0.16 + 0.18 * (1 - shotOpen) + 0.12 * centerness)
+            local cornerPull = math.max(0, cornerness * (0.14 + 0.82 * laneTightness) + distTightBoost + longCornerInset - sameSideNarrow)
             local localX = xf - xSign * cornerPull
 
             -- Верхние tight-angle удары опускаем ниже, чтобы не лизать стойку/перекладину.
             local yRange = math.max(0.5, GoalHeight - Y_TOP_TARGET - Y_BOT_INSET)
             local localY = Y_BOT_INSET + yf * yRange
             local highFrac = math.clamp((yf - 0.60) / 0.40, 0, 1)
-            local localY = math.max(Y_BOT_INSET, localY - (laneTightness + distTightBoost) * highFrac * 0.54)
+            local localY = math.max(Y_BOT_INSET, localY - (laneTightness + distTightBoost + longCornerInset * 0.55) * highFrac * 0.54)
 
             -- 3D позиция цели (idealPos) — точка в плоскости ворот
             local idealPos = GoalCFrame * Vector3.new(localX, localY, 0)
