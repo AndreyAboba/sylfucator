@@ -153,47 +153,50 @@ local function DrawTrajectory(startPos, peakPos, endPos, peakFrac, spinStr)
         for _, l in ipairs(TrajectoryLines) do l.Visible = false end; return
     end
 
-    -- Базовая дуга по квадратичному Безье через физический peakPos.
-    local f = math.clamp(peakFrac or 0.40, 0.36, 0.44)
-    local Pc = (peakPos - startPos * ((1-f)^2) - endPos * (f^2))
-               / math.max(2 * f * (1-f), 1e-4)
+    -- Горизонтальные направления
+    local fwdH = Vector3.new(endPos.X - startPos.X, 0, endPos.Z - startPos.Z)
+    if fwdH.Magnitude < 0.1 then fwdH = Vector3.new(1,0,0) end
+    fwdH = fwdH.Unit
+    local right = Vector3.new(-fwdH.Z, 0, fwdH.X)
 
-    -- Визуальная компенсация реверсивного Magnus.
-    -- В игре: "Right" label -> мяч летит ВЛЕВО, "Left" -> ВПРАВО.
-    -- Но peakPos уже смещён в сторону АИМа (derivation), то есть НАОБОРОТ.
-    -- Поэтому добавляем боковой сдвиг, инвертированный относительно spin label.
-    local fwd = endPos - startPos
-    fwd = Vector3.new(fwd.X, 0, fwd.Z)
-    if fwd.Magnitude < 0.1 then fwd = Vector3.new(1,0,0) end
-    fwd = fwd.Unit
-    local right = Vector3.new(-fwd.Z, 0, fwd.X)
+    -- Нейтральный пик: peakPos содержит боковое смещение из-за derivation.
+    -- Оставляем только высоту (Y), а XZ проецируем на прямую start→end.
+    -- Это даёт правильную вертикальную дугу без артефактов от аим-смещения.
+    local fwdTotal = (Vector3.new(endPos.X-startPos.X, 0, endPos.Z-startPos.Z)).Magnitude
+    local peakHoriz= (Vector3.new(peakPos.X-startPos.X, 0, peakPos.Z-startPos.Z)).Magnitude
+    local t_peak   = (fwdTotal > 0.1) and math.clamp(peakHoriz/fwdTotal, 0.36, 0.44) or 0.40
+    local neutralXZ= startPos + fwdH * peakHoriz
+    local neutralPk= Vector3.new(neutralXZ.X, peakPos.Y, neutralXZ.Z)
 
+    -- Bezier-контрольная точка
+    local f   = t_peak
+    local Pc  = (neutralPk - startPos*((1-f)^2) - endPos*(f^2))
+                / math.max(2*f*(1-f), 1e-4)
+
+    -- Боковой Magnus-curl (только от spinStr, без Bezier bias)
+    -- Игра ИНВЕРТИРУЕТ: "Right" → мяч летит ВЛЕВО, "Left" → ВПРАВО
     local spinSign = (spinStr == "Right") and -1 or (spinStr == "Left") and 1 or 0
-    local curlAmp  = 1.2 + math.min((endPos - startPos).Magnitude / 140, 0.9)
+    local dist3D   = (endPos - startPos).Magnitude
+    -- Амплитуда растёт с дистанцией, нулевая на старте и финише
+    local curlAmp  = spinSign * math.min(0.9 + dist3D / 160, 2.2)
 
     local function point(t)
-        local mt = 1 - t
+        local mt  = 1 - t
         local arc = startPos*(mt*mt) + Pc*(2*mt*t) + endPos*(t*t)
-        -- sin(pi*t): 0 на старте/финише, max в середине
-        local curl = right * spinSign * curlAmp * math.sin(math.pi * t)
+        local curl= right * curlAmp * math.sin(math.pi * t)
         return arc + curl
     end
 
     for i = 1, TRAJ_SEGMENTS do
-        local t0 = (i-1) / TRAJ_SEGMENTS
+        local t0 = (i-1)/TRAJ_SEGMENTS
         local t1 = i / TRAJ_SEGMENTS
-        local p0 = point(t0)
-        local p1 = point(t1)
+        local p0 = point(t0); local p1 = point(t1)
         local s0, v0 = Camera:WorldToViewportPoint(p0)
         local s1, v1 = Camera:WorldToViewportPoint(p1)
         local l = TrajectoryLines[i]
         if v0 and v1 and s0.Z > 0 and s1.Z > 0 then
-            l.From = Vector2.new(s0.X, s0.Y)
-            l.To   = Vector2.new(s1.X, s1.Y)
-            l.Visible = true
-        else
-            l.Visible = false
-        end
+            l.From = Vector2.new(s0.X, s0.Y); l.To = Vector2.new(s1.X, s1.Y); l.Visible = true
+        else l.Visible = false end
     end
 end
 
@@ -671,7 +674,14 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             -- Это помогает долёту и заставляет сервер видеть более далёкую цель для спина/свечек.
             local depthAlpha  = 1 - math.exp(-dist / 95)
             local goalDepth   = GOAL_DEPTH_MIN + (GOAL_DEPTH_MAX - GOAL_DEPTH_MIN) * depthAlpha
-            if spinDir ~= "None" then goalDepth = goalDepth + 0.35 end
+            if spinDir ~= "None" then
+                goalDepth = goalDepth + 2.5  -- глубже → сервер видит бо́льшую дистанцию → применяет спин
+                -- Защита от перелёта: спин иногда добавляет высоту на 90-160 studs,
+                -- поэтому слегка штрафуем самые верхние цели с активным спином.
+                local spinHeightPenalty = (localY / math.max(GoalHeight,1)) > 0.80
+                                        and dist > 90 and dist < 170
+                if spinHeightPenalty then score = score - 3.5 end
+            end
             if isLobShot then goalDepth = goalDepth + 0.45 end
             local shootPos    = GoalCFrame * Vector3.new(shootLocalX, localY, -goalDepth)
 
@@ -774,8 +784,11 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             -- Открытость угла рикошета
             -- Если игрок с той же стороны что и штанга — угол закрыт (летим почти параллельно)
             -- pd.postLocalX < 0 = левая штанга; playerLocalX < -halfW*0.25 = игрок слева
-            local isClosedAngle = (pd.postLocalX < 0 and playerLocalX < -halfW * 0.20)
-                                or (pd.postLocalX > 0 and playerLocalX >  halfW * 0.20)
+            local isClosedAngle = (pd.postLocalX < 0 and playerLocalX < -halfW * 0.15)
+                                or (pd.postLocalX > 0 and playerLocalX >  halfW * 0.15)
+            -- Открытый угол: игрок на противоположной стороне → хороший угол атаки
+            local isOpenSide    = (pd.postLocalX < 0 and playerLocalX >  halfW * 0.20)
+                                or (pd.postLocalX > 0 and playerLocalX < -halfW * 0.20)
 
             for _, hf in ipairs({0.20, 0.45, 0.72}) do
                 local hitY      = hf * GoalHeight
@@ -823,7 +836,8 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
                     -- Мяч после рикошета летит на противоположную сторону от GK
                     local crossSide = (pgkX > 0 and landX < -GoalWidth*0.20)
                                    or (pgkX < 0 and landX >  GoalWidth*0.20)
-                    if crossSide then rscore = rscore + 7.0 end
+                    if crossSide   then rscore = rscore + 7.0 end
+                    if isOpenSide  then rscore = rscore + 4.5 end
 
                     -- Бонус за угол рикошета близкий к 45° (идеальный отскок)
                     rscore = rscore + 7.5  -- рикошет: приоритет сложной атаки
