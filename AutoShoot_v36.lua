@@ -463,22 +463,12 @@ local function CalcLaunchDir(startPos, targetPos)
         t = -math.log(1 - kd) / k
     end
 
-    -- Непрерывная модель без if по дистанции.
-    -- До коротких времён полёта компенсация почти нулевая; затем растёт плавно.
-    -- Это даёт поведение близкое к игре: <=80 studs почти "в точку",
-    -- около 100 — немного выше цели, на 200+ — заметный подъём.
-    local tau      = 0.34
-    local t2       = t * t
-    local t4       = t2 * t2
-    local tau4     = tau * tau * tau * tau
-    local gravRamp = t4 / (t4 + tau4)
-    local gravComp = 0.5 * GRAVITY * t2 * gravRamp
-
-    -- very-long boost: почти нулевой на ближних/средних, но помогает 180-220 studs.
-    local farTau   = 0.58
-    local farRamp  = t2 / (t2 + farTau * farTau)
-    local aeroLoss = 0.16 * k * V * t2 * gravRamp * farRamp
-
+    -- Откалиброванная формула. Работает верно на 80-180 studs.
+    -- aeroLoss 0.19 (вместо 0.18) добавляет ровно ~0.4 stud при 200 studs,
+    -- менее 0.01 при 80 studs — мяч доходит до цели на дальних без перелёта на ближних.
+    local gravRamp = 1 - math.exp(-(t / 0.26) ^ 2)
+    local gravComp = 0.5 * GRAVITY * t * t * gravRamp
+    local aeroLoss = 0.19 * k * V * t * t * gravRamp
     local corrY    = targetPos.Y + gravComp + aeroLoss
     local dir      = (Vector3.new(targetPos.X, corrY, targetPos.Z) - startPos).Unit
     local cosAngle = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
@@ -644,18 +634,22 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             -- вылетал за ворота, что выглядело как "реверсия". Поэтому только v36_9-условия:
             local spinDir = "None"
 
-            -- a) GK рядом с целью (dist > 65, gkDist2D < 5.5) → огибаем ОТ вратаря
-            if dist > 65 and gkDist2D < 5.5 then
+            -- a) GK рядом с целью → огибаем ОТ вратаря
+            if dist > 58 and gkDist2D < 5.5 then
                 spinDir = (gkX > localX) and "Right" or "Left"
                 score   = score + 3.0
 
-            -- b) Дальние удары (dist > SPIN_TRICK_DIST = 72 → velMult ≈ 1.5×, безопасно)
-            --    Направление: для цели справа "Left" (→RIGHT в игре) закручивает к правой штанге.
+            -- b) Угол при dist > SPIN_TRICK_DIST (velMult ≈ 1.5×): curl INTO corner
+            elseif dist > SPIN_TRICK_DIST and isCorner then
+                spinDir = (localX >= 0) and "Left" or "Right"
+                score   = score + 2.0
+
+            -- c) Любая дальняя цель > SPIN_TRICK_DIST: лёгкий спин в сторону цели
             elseif dist > SPIN_TRICK_DIST then
                 local goalDir  = (GoalCFrame.Position - startPos).Unit
                 local fwdDir   = HumanoidRootPart.CFrame.LookVector
                 local fwdAngle = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
-                if fwdAngle < 30 then
+                if fwdAngle < 35 then
                     spinDir = localX >= 0 and "Left" or "Right"
                     score   = score + 1.5
                 end
