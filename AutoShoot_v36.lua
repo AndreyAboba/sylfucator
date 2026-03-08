@@ -87,6 +87,7 @@ local AutoPickupStatus     = { Running = false, Connection = nil }
 
 local ShowTrajectory      = true
 local Show3DBoxes         = true
+local VisualsOnlyWithBall = true
 local TrajectoryColor     = Color3.fromRGB(255, 165, 0)
 local StartCircleColor    = Color3.fromRGB(255, 210, 80)
 local TargetCubeColor     = Color3.fromRGB(0,255,0)
@@ -181,7 +182,7 @@ local function InitializeCubes()
         if TrajectoryLines[i] and TrajectoryLines[i].Remove then TrajectoryLines[i]:Remove() end
         TrajectoryLines[i] = Drawing.new("Line")
     end
-    for i = 1, 16 do
+    for i = 1, 28 do
         if StartCircle[i] and StartCircle[i].Remove then StartCircle[i]:Remove() end
         StartCircle[i] = Drawing.new("Line")
     end
@@ -1356,34 +1357,37 @@ AutoShoot.Start = function()
     AutoShootStatus.RenderConnection = RunService.RenderStepped:Connect(function()
         local width = UpdateGoal()
         local hasTarget = TargetPoint ~= nil
+        local ball = Workspace:FindFirstChild("ball")
+        local hasBall = ball and ball:FindFirstChild("playerWeld") and ball.creator.Value == LocalPlayer
+        local showVisuals = (not VisualsOnlyWithBall) or hasBall
 
         -- 🟠 Траектория дуги (оранжевые линии) — главный визуал
-        if ShowTrajectory and hasTarget and CurrentLaunchDir and CurrentFlightTime > 0 then
+        if showVisuals and ShowTrajectory and hasTarget and CurrentLaunchDir and CurrentFlightTime > 0 then
             DrawTrajectory(GetVisualStartPos(), CurrentPeakPos, PredictedLand, CurrentPeakFrac, CurrentSpin)
         else
             for _, l in ipairs(TrajectoryLines) do l.Visible = false end
             for _, l in ipairs(StartCircle) do l.Visible = false end
         end
 
-        if Show3DBoxes and AimPoint then
+        if showVisuals and Show3DBoxes and AimPoint then
             DrawOrientedCube(TargetCube, CFrame.new(AimPoint), Vector3.new(2,2,2))
         else
             for _, l in ipairs(TargetCube) do l.Visible = false end
         end
 
-        if Show3DBoxes and PredictedLand then
+        if showVisuals and Show3DBoxes and PredictedLand then
             DrawOrientedCube(GoalCube, CFrame.new(PredictedLand), Vector3.new(2.5,2.5,2.5))
         else
             for _, l in ipairs(GoalCube) do l.Visible = false end
         end
 
-        if Show3DBoxes and CurrentPeakPos and hasTarget then
+        if showVisuals and Show3DBoxes and CurrentPeakPos and hasTarget then
             DrawOrientedCube(PeakCube, CFrame.new(CurrentPeakPos), Vector3.new(2,2,2))
         else
             for _, l in ipairs(PeakCube) do l.Visible = false end
         end
 
-        if Show3DBoxes and GoalCFrame and width and GoalHeight then
+        if showVisuals and Show3DBoxes and GoalCFrame and width and GoalHeight then
             DrawOrientedCube(NoSpinCube, GoalCFrame * CFrame.new(0, GoalHeight/2, 0),
                 Vector3.new(width, GoalHeight, 1))
         else
@@ -1558,6 +1562,10 @@ local function SetupUI(UI)
             Name = "Show 3D Boxes", Default = Show3DBoxes,
             Callback = function(v) Show3DBoxes = v end
         }, "Show3DBoxes")
+        uiElements.VisualsOnlyWithBall = UI.Sections.AutoShoot:Toggle({
+            Name = "Visuals Only With Ball", Default = VisualsOnlyWithBall,
+            Callback = function(v) VisualsOnlyWithBall = v end
+        }, "VisualsOnlyWithBall")
 
         uiElements.TrajectoryColor = AddSectionColorpicker(UI.Sections.AutoShoot, {
             Name = "Trajectory Color", Default = TrajectoryColor,
