@@ -148,39 +148,52 @@ end
 
 -- DrawTrajectory: кубический Безье с боковым смещением для Магнус-эффекта.
 -- P0=start, P3=land (красный куб), P1/P2 = управляющие точки для подъёма + Magnus curl.
-local function DrawTrajectory(startPos, peakPos, endPos, peakFrac)
+local function DrawTrajectory(startPos, peakPos, endPos, peakFrac, spinStr)
     if not peakPos or not endPos then
         for _, l in ipairs(TrajectoryLines) do l.Visible = false end; return
     end
 
-    -- Квадратичный Безье: start → Pc (контрольная) → end.
-    -- peakPos уже смещён в направлении аима (деривация спина сдвигает его в сторону).
-    -- endPos = idealPos = куда мяч реально прилетит.
-    -- Эти два факта вместе дают ЕСТЕСТВЕННУЮ кривую спина без дополнительных слоёв.
-    --
-    -- f = параметр t в котором находится peakPos.
-    -- Зажат в [0.28, 0.58] чтобы Pc не улетал в бесконечность при очень малом f
-    -- (плоские удары на близкой дистанции, где tPeak << flightTime).
-    -- f фиксирован ≈ 0.40: peakPos сэмплирован при t=0.40*flightTime,
-    -- clamp [0.36, 0.44] сохраняет симметричность и убирает визуальный эффект "дуга в конце".
+    -- Базовая дуга по квадратичному Безье через физический peakPos.
     local f = math.clamp(peakFrac or 0.40, 0.36, 0.44)
     local Pc = (peakPos - startPos * ((1-f)^2) - endPos * (f^2))
                / math.max(2 * f * (1-f), 1e-4)
 
+    -- Визуальная компенсация реверсивного Magnus.
+    -- В игре: "Right" label -> мяч летит ВЛЕВО, "Left" -> ВПРАВО.
+    -- Но peakPos уже смещён в сторону АИМа (derivation), то есть НАОБОРОТ.
+    -- Поэтому добавляем боковой сдвиг, инвертированный относительно spin label.
+    local fwd = endPos - startPos
+    fwd = Vector3.new(fwd.X, 0, fwd.Z)
+    if fwd.Magnitude < 0.1 then fwd = Vector3.new(1,0,0) end
+    fwd = fwd.Unit
+    local right = Vector3.new(-fwd.Z, 0, fwd.X)
+
+    local spinSign = (spinStr == "Right") and -1 or (spinStr == "Left") and 1 or 0
+    local curlAmp  = 1.2 + math.min((endPos - startPos).Magnitude / 140, 0.9)
+
+    local function point(t)
+        local mt = 1 - t
+        local arc = startPos*(mt*mt) + Pc*(2*mt*t) + endPos*(t*t)
+        -- sin(pi*t): 0 на старте/финише, max в середине
+        local curl = right * spinSign * curlAmp * math.sin(math.pi * t)
+        return arc + curl
+    end
+
     for i = 1, TRAJ_SEGMENTS do
         local t0 = (i-1) / TRAJ_SEGMENTS
         local t1 = i / TRAJ_SEGMENTS
-        local function bz(t)
-            local mt = 1-t
-            return startPos*(mt*mt) + Pc*(2*mt*t) + endPos*(t*t)
-        end
-        local p0 = bz(t0); local p1 = bz(t1)
+        local p0 = point(t0)
+        local p1 = point(t1)
         local s0, v0 = Camera:WorldToViewportPoint(p0)
         local s1, v1 = Camera:WorldToViewportPoint(p1)
         local l = TrajectoryLines[i]
         if v0 and v1 and s0.Z > 0 and s1.Z > 0 then
-            l.From = Vector2.new(s0.X, s0.Y); l.To = Vector2.new(s1.X, s1.Y); l.Visible = true
-        else l.Visible = false end
+            l.From = Vector2.new(s0.X, s0.Y)
+            l.To   = Vector2.new(s1.X, s1.Y)
+            l.Visible = true
+        else
+            l.Visible = false
+        end
     end
 end
 
@@ -1101,7 +1114,7 @@ AutoShoot.Start = function()
 
         -- 🟠 Траектория дуги (оранжевые линии) — главный визуал
         if hasTarget and CurrentLaunchDir and CurrentFlightTime > 0 then
-            DrawTrajectory(GetBallStartPos(), CurrentPeakPos, PredictedLand, CurrentPeakFrac)
+            DrawTrajectory(GetBallStartPos(), CurrentPeakPos, PredictedLand, CurrentPeakFrac, CurrentSpin)
         else
             for _, l in ipairs(TrajectoryLines) do l.Visible = false end
         end
