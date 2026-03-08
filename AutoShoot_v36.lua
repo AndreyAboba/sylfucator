@@ -94,13 +94,13 @@ local GoalCubeColor       = Color3.fromRGB(255,0,0)
 local NoSpinCubeColor     = Color3.fromRGB(0,200,255)
 local PeakCubeColor       = Color3.fromRGB(255,255,0)
 local TrajectoryAlpha     = 0.55
-local BoxAlpha            = 0.82
+local BoxAlpha            = 0.90
 local TrajectoryThickness = 1.6
-local BoxThicknessMain    = 4
-local BoxThicknessThin    = 2
+local BoxThicknessMain    = 2.2
+local BoxThicknessThin    = 1.2
 local StartCircleRadius   = 4
 local StartCircleThickness= 1.5
-local StartCircleAlpha    = 0.80
+local StartCircleAlpha    = 0.85
 
 -- ============================================================
 -- GUI
@@ -135,7 +135,7 @@ local TargetCube, GoalCube, NoSpinCube = {}, {}, {}
 local TRAJ_SEGMENTS = 20               -- кол-во сегментов дуги траектории
 local TrajectoryLines = {}             -- оранжевая пунктирная дуга
 local PeakCube = {}                    -- жёлтый бокс: пик траектории
-local StartCircle = nil                -- круг в StartPos, из которого выходит траектория
+local StartCircle = {}                 -- 3D-круг в StartPos, из которого выходит траектория
 local function ApplyVisualStyles()
     for _, l in ipairs(TrajectoryLines) do
         l.Color = TrajectoryColor
@@ -157,13 +157,12 @@ local function ApplyVisualStyles()
     SC(GoalCube,   GoalCubeColor,   BoxThicknessMain)
     SC(NoSpinCube, NoSpinCubeColor, BoxThicknessThin)
     SC(PeakCube,   PeakCubeColor,   math.max(BoxThicknessThin + 1, 3))
-    if StartCircle then
-        StartCircle.Color = StartCircleColor
-        StartCircle.Thickness = StartCircleThickness
-        StartCircle.Transparency = StartCircleAlpha
-        StartCircle.NumSides = 24
-        StartCircle.Filled = false
-        StartCircle.Visible = false
+    for _, l in ipairs(StartCircle) do
+        l.Color = StartCircleColor
+        l.Thickness = StartCircleThickness
+        l.Transparency = StartCircleAlpha
+        l.ZIndex = 1000
+        l.Visible = false
     end
 end
 
@@ -182,8 +181,10 @@ local function InitializeCubes()
         if TrajectoryLines[i] and TrajectoryLines[i].Remove then TrajectoryLines[i]:Remove() end
         TrajectoryLines[i] = Drawing.new("Line")
     end
-    if StartCircle and StartCircle.Remove then StartCircle:Remove() end
-    StartCircle = Drawing.new("Circle")
+    for i = 1, 16 do
+        if StartCircle[i] and StartCircle[i].Remove then StartCircle[i]:Remove() end
+        StartCircle[i] = Drawing.new("Line")
+    end
     ApplyVisualStyles()
 end
 
@@ -192,7 +193,7 @@ end
 local function DrawTrajectory(startPos, peakPos, endPos, peakFrac, spinStr)
     if not ShowTrajectory or not peakPos or not endPos then
         for _, l in ipairs(TrajectoryLines) do l.Visible = false end
-        if StartCircle then StartCircle.Visible = false end
+        for _, l in ipairs(StartCircle) do l.Visible = false end
         return
     end
 
@@ -241,15 +242,33 @@ local function DrawTrajectory(startPos, peakPos, endPos, peakFrac, spinStr)
             l.From = Vector2.new(s0.X, s0.Y); l.To = Vector2.new(s1.X, s1.Y); l.Visible = true
         else l.Visible = false end
     end
-    if StartCircle then
-        local ss, vis = Camera:WorldToViewportPoint(startPos)
-        if vis and ss.Z > 0 then
-            StartCircle.Position = Vector2.new(ss.X, ss.Y)
-            StartCircle.Radius = StartCircleRadius
-            StartCircle.Visible = true
-        else
-            StartCircle.Visible = false
+    local ringR = math.max(0.9, 0.70 + dist3D * 0.006)
+    local ringCF = CFrame.new(startPos) * CFrame.fromAxisAngle(fwdH, math.rad(90))
+    local prev2D, prevOk = nil, false
+    for i = 1, #StartCircle do
+        local a = ((i-1) / #StartCircle) * math.pi * 2
+        local p = ringCF * Vector3.new(math.cos(a) * ringR, math.sin(a) * ringR, 0)
+        local s, v = Camera:WorldToViewportPoint(p)
+        local ok = v and s.Z > 0
+        if i > 1 and prevOk and ok then
+            local l = StartCircle[i-1]
+            l.From = prev2D
+            l.To = Vector2.new(s.X, s.Y)
+            l.Visible = true
+        elseif i > 1 then
+            StartCircle[i-1].Visible = false
         end
+        prev2D, prevOk = Vector2.new(s.X, s.Y), ok
+    end
+    local firstP = ringCF * Vector3.new(ringR, 0, 0)
+    local fs, fv = Camera:WorldToViewportPoint(firstP)
+    if prevOk and fv and fs.Z > 0 then
+        local l = StartCircle[#StartCircle]
+        l.From = prev2D
+        l.To = Vector2.new(fs.X, fs.Y)
+        l.Visible = true
+    else
+        StartCircle[#StartCircle].Visible = false
     end
 end
 
@@ -1330,7 +1349,7 @@ AutoShoot.Start = function()
             DrawTrajectory(GetBallStartPos(), CurrentPeakPos, PredictedLand, CurrentPeakFrac, CurrentSpin)
         else
             for _, l in ipairs(TrajectoryLines) do l.Visible = false end
-            if StartCircle then StartCircle.Visible = false end
+            for _, l in ipairs(StartCircle) do l.Visible = false end
         end
 
         if Show3DBoxes and AimPoint then
@@ -1375,7 +1394,8 @@ AutoShoot.Stop = function()
     for i = 1, TRAJ_SEGMENTS do
         if TrajectoryLines[i] and TrajectoryLines[i].Remove then TrajectoryLines[i]:Remove() end
     end
-    if StartCircle and StartCircle.Remove then StartCircle:Remove(); StartCircle = nil end
+    for i = 1, #StartCircle do if StartCircle[i] and StartCircle[i].Remove then StartCircle[i]:Remove() end end
+    StartCircle = {}
     if AutoShootStatus.ButtonGui then AutoShootStatus.ButtonGui:Destroy(); AutoShootStatus.ButtonGui = nil end
 end
 
