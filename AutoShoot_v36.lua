@@ -52,8 +52,9 @@ local SPIN_TRICK_DIST      = 72     -- Граница "близкой" дист�
 local SPIN_SERVER_MIN_DIST = 130    -- Ниже ~130 studs сервер почти не принимает закручивание
 local AutoShootCurveDistanceLimit = 300 -- Максимальная дистанция, на которой разрешён закрут
 local RICOCHET_MIN_DIST       = 72  -- Ниже рикошет от земли редко полезен
-local RICOCHET_MAX_DIST       = 175 -- Слишком далеко рикошет теряет точность
-local CANDLE_MIN_DIST         = 125 -- Свеча имеет смысл только со средней/дальней дистанции
+local RICOCHET_MAX_DIST       = 190 -- Чуть шире диапазон, чтобы сложные рикошеты реально выбирались
+local CANDLE_MIN_DIST         = 140 -- Свеча имеет смысл только на 140-200 studs
+local CANDLE_MAX_DIST         = 200
 local SPIN_CROSS_BLOCK_X   = 0.18   -- Cross-goal spin (слева→вправо / справа→влево) часто не принимается
 local AutoShootDerivMult   = 4.5    -- studs деривации при d=100. Мяч улетает меньше → увеличь.
 local BALL_RADIUS           = 1.168  -- радиус мяча: 2.336 / 2 studs
@@ -511,7 +512,8 @@ local function CalcLaunchDir(startPos, targetPos)
     local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.62 * s * s * s
     local upDy     = math.max(targetPos.Y - startPos.Y, 0)
     local nearRise = upDy * 0.68 * math.exp(-(t / 0.34) ^ 2)
-    local corrY    = targetPos.Y + baseComp * farScale - nearRise
+    local midTrim  = 0.75 * math.exp(-((t - 0.50) / 0.16) ^ 2)
+    local corrY    = targetPos.Y + baseComp * farScale - nearRise - midTrim
     local dir      = (Vector3.new(targetPos.X, corrY, targetPos.Z) - startPos).Unit
     local cosAngle = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
 
@@ -569,12 +571,13 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             -- Геометрия угла зависит от открытости коридора полёта.
             -- Если игрок с той же стороны и угол реально открыт, можно чуть ближе к штанге.
             -- Из центра или при закрытом коридоре — наоборот сильнее уходим от штанги.
+            local distTight = math.clamp((dist - 130) / 120, 0, 1)
             local laneTightness = cornerness * math.clamp(
-                0.16 + 0.56 * centerness + 0.48 * sameSide * playerSideFrac - 0.76 * shotOpen,
+                0.18 + 0.60 * centerness + 0.54 * sameSide * playerSideFrac - 0.72 * shotOpen + 0.22 * distTight,
                 0, 1
             )
-            local sameSideNarrow = cornerness * math.max(0, sameSide * playerSideFrac * (shotOpen - 0.42)) * 0.22
-            local cornerPull = math.max(0, cornerness * (0.10 + 0.72 * laneTightness) - sameSideNarrow)
+            local sameSideNarrow = cornerness * math.max(0, sameSide * playerSideFrac * (shotOpen - 0.42)) * (0.22 - 0.10 * distTight)
+            local cornerPull = math.max(0, cornerness * (0.12 + 0.82 * laneTightness) - sameSideNarrow)
             local localX = xf - xSign * cornerPull
 
             -- Верхние tight-angle удары опускаем ниже, чтобы не лизать стойку/перекладину.
@@ -612,7 +615,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             local isTopCorner = (yf >= 0.66) and (math.abs(localX) > halfW * 0.45)
             local isCorner    = math.abs(localX) > halfW * 0.5
             local isLobShot   = (yf >= 0.85)
-            local isCandleShot= (yf >= 0.92) and dist >= CANDLE_MIN_DIST
+            local isCandleShot= (yf >= 0.92) and dist >= CANDLE_MIN_DIST and dist <= CANDLE_MAX_DIST
 
             -- Верхние углы: прыжок + смещение = труднее всего
             if isTopCorner then score = score + 9.0 end
@@ -635,10 +638,11 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
                 if dist < 50 then score = score - 12.0 end
             end
             if isCandleShot then
-                score = score + 3.5
-                if pgkY < GoalHeight * 0.62 then score = score + 3.0 end
-                if isAggressive then score = score + 3.5 end
-                if math.abs(pgkX) < halfW * 0.32 then score = score + 2.0 end
+                score = score + 6.0
+                if pgkY < GoalHeight * 0.62 then score = score + 3.6 end
+                if isAggressive then score = score + 4.5 end
+                if math.abs(pgkX) < halfW * 0.32 then score = score + 3.0 end
+                if dist >= 150 and dist <= 190 then score = score + 2.4 end
             end
 
             -- На близких дистанциях (<45 studs) штраф за очень высокие точки (>85% H)
@@ -864,21 +868,21 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             -- Сложный рикошет: бьём мяч в землю перед воротами, чтобы после отскока он вошёл в створ.
             -- Особенно полезно против rush/центрального GK и для NPC, которым спин не нужен.
             local canRicochet = dist >= RICOCHET_MIN_DIST and dist <= RICOCHET_MAX_DIST
-                             and spinDir == "None" and not isTopCorner and localY < GoalHeight * 0.62
+                             and spinDir == "None" and not isTopCorner and localY < GoalHeight * 0.70
             if canRicochet then
-                local bounceFront = 4.2 + 4.8 * math.clamp(dist / 170, 0, 1)
-                local bounceX     = math.clamp(localX * 0.86, -halfW * 0.82, halfW * 0.82)
+                local bounceFront = 4.0 + 5.4 * math.clamp(dist / 180, 0, 1)
+                local bounceX     = math.clamp(localX * 0.84, -halfW * 0.84, halfW * 0.84)
                 local bouncePos   = GoalCFrame * Vector3.new(bounceX, Y_BOT_INSET + 0.06, bounceFront)
                 local ricDir, _, ricT = CalcLaunchDir(startPos, bouncePos)
                 local ricAng = math.deg(math.asin(math.clamp(ricDir.Y, -1, 1)))
-                local ricOk  = ricAng > 2 and ricAng < 26
+                local ricOk  = ricAng > 1 and ricAng < 28
                 if ricOk then
-                    local ricScore = score - 2.8
-                    if gkIsNPC then ricScore = ricScore + 4.5 end
-                    if isAggressive then ricScore = ricScore + 5.5 end
-                    if math.abs(pgkX) < halfW * 0.30 then ricScore = ricScore + 3.2 end
-                    if pgkY > GoalHeight * 0.40 then ricScore = ricScore + 1.8 end
-                    if localY < GoalHeight * 0.42 then ricScore = ricScore + 1.5 end
+                    local ricScore = score + 0.8
+                    if gkIsNPC then ricScore = ricScore + 5.2 end
+                    if isAggressive then ricScore = ricScore + 6.2 end
+                    if math.abs(pgkX) < halfW * 0.32 then ricScore = ricScore + 4.0 end
+                    if pgkY > GoalHeight * 0.40 then ricScore = ricScore + 2.2 end
+                    if localY < GoalHeight * 0.46 then ricScore = ricScore + 2.0 end
                     local ricT40  = 0.40 * ricT
                     local ricHF40 = (AutoShootDragComp > 1e-5)
                         and ((1 - math.exp(-AutoShootDragComp * ricT40)) / AutoShootDragComp)
