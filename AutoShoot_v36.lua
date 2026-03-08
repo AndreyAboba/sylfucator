@@ -49,7 +49,8 @@ local GK_REACH_SPEED       = 12.0   -- Скорость реакции GK для
 local PAST_GOAL_BASE       = 45     -- Базовое расширение цели (studs) для всех ударов
 local PAST_GOAL_CLOSE      = 70     -- Доп. расширение для ближних (<SPIN_TRICK_DIST) ударов
 local SPIN_TRICK_DIST      = 72     -- Граница "близкой" дистанции
-local MIN_SPIN_FAR_DIST    = 120    -- сервер не принимает спин в диапазоне [72, 120)
+local SPIN_SERVER_MIN_DIST = 120    -- Ниже сервер почти не принимает закручивание
+local SPIN_CROSS_BLOCK_X   = 0.18   -- Cross-goal spin (слева→вправо / справа→влево) часто не принимается
 local AutoShootDerivMult   = 4.5    -- studs деривации при d=100. Мяч улетает меньше → увеличь.
 local BALL_RADIUS           = 1.168  -- радиус мяча: 2.336 / 2 studs
 -- Безопасный отступ = радиус мяча + небольшой запас чтобы мяч не касался штанги
@@ -468,10 +469,11 @@ local function CalcLaunchDir(startPos, targetPos)
     end
 
     -- Откалиброванная формула. Работает верно на 80-180 studs.
-    -- Откалиброванная формула (0.18 = правильное значение для 80-180 studs).
+    -- aeroLoss 0.19 (вместо 0.18) добавляет ровно ~0.4 stud при 200 studs,
+    -- менее 0.01 при 80 studs — мяч доходит до цели на дальних без перелёта на ближних.
     local gravRamp = 1 - math.exp(-(t / 0.26) ^ 2)
     local gravComp = 0.5 * GRAVITY * t * t * gravRamp
-    local aeroLoss = 0.18 * k * V * t * t * gravRamp
+    local aeroLoss = 0.19 * k * V * t * t * gravRamp
     local corrY    = targetPos.Y + gravComp + aeroLoss
     local dir      = (Vector3.new(targetPos.X, corrY, targetPos.Z) - startPos).Unit
     local cosAngle = math.sqrt(dir.X*dir.X + dir.Z*dir.Z)
@@ -517,7 +519,13 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
 
     for _, xf in ipairs(xPoints) do
         for _, yf in ipairs(yFracs) do
-            local localX = xf
+            local xSign = (xf >= 0) and 1 or -1
+            local cornerness = math.clamp((math.abs(xf) / math.max(halfW, 0.1) - 0.70) / 0.30, 0, 1)
+            local sameSide = ((playerLocalX >= 0 and xf >= 0) or (playerLocalX < 0 and xf < 0)) and 1 or 0
+            local playerSideFrac = math.clamp(math.abs(playerLocalX) / math.max(halfW, 0.1), 0, 1)
+            -- Чем острее угол (игрок и угол на одной стороне), тем сильнее уходим от штанги.
+            local cornerPull = cornerness * (0.28 + 0.62 * sameSide * playerSideFrac)
+            local localX = xf - xSign * cornerPull
             -- Цель с учётом вертикального инсета: центр мяча никогда не доходит
             -- до перекладины или пола ближе чем на радиус мяча + запас точности.
             local yRange = math.max(0.5, GoalHeight - Y_TOP_TARGET - Y_BOT_INSET)
@@ -632,39 +640,35 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             -- ПРАВИЛО ИГРЫ (инверсия): "Right" label → мяч ВЛЕВО, "Left" label → мяч ВПРАВО.
             -- Деривация всегда компенсирует снос: "Right"→+dMult, "Left"→−dMult.
             --
+            -- Причина старых багов: условия b и c добавляли спин при dist < SPIN_TRICK_DIST,
+            -- где velMult ≈ 3×. Реальный снос сервером ≈ 3× больше нашего dMult → мяч
+            -- вылетал за ворота, что выглядело как "реверсия". Поэтому только v36_9-условия:
             local spinDir = "None"
 
-            -- Сервер принимает спин только в двух диапазонах:
-            --   dist < SPIN_TRICK_DIST (72): PAST_GOAL_CLOSE даёт effective >= 187 studs ✓
-            --   dist >= MIN_SPIN_FAR_DIST (120): effective = dist+45 >= 165 studs ✓
-            --   dist 72-119: effective 117-164 → сервер ИГНОРИРУЕТ спин ✗
-            local spinOk = (dist < SPIN_TRICK_DIST) or (dist >= MIN_SPIN_FAR_DIST)
+            -- Серверные ограничения для спина:
+            -- 1) ниже ~120 studs спин почти не применяется;
+            -- 2) cross-goal спин (игрок слева -> правая цель и наоборот) часто игнорируется сервером.
+            local wantsCrossGoal = (playerLocalX < -halfW * SPIN_CROSS_BLOCK_X and localX >  halfW * SPIN_CROSS_BLOCK_X)
+                                or (playerLocalX >  halfW * SPIN_CROSS_BLOCK_X and localX < -halfW * SPIN_CROSS_BLOCK_X)
 
-            -- Если игрок на ПРОТИВОПОЛОЖНОЙ стороне от цели — угол подхода неверный,
-            -- сервер тоже не принимает такой спин (подтверждено пользователем).
-            local spinAngleOk = not ((playerLocalX < -halfW*0.25 and localX >  halfW*0.30)
-                                  or (playerLocalX >  halfW*0.25 and localX < -halfW*0.30))
+            -- a) GK рядом с целью → огибаем ОТ вратаря, но только там где сервер принимает спин
+            if dist > SPIN_SERVER_MIN_DIST and not wantsCrossGoal and gkDist2D < 5.5 then
+                spinDir = (gkX > localX) and "Right" or "Left"
+                score   = score + 2.8
 
-            if spinOk and spinAngleOk then
-                -- a) GK рядом с целью (работает в обоих диапазонах)
-                if gkDist2D < 5.0 then
-                    spinDir = (gkX > localX) and "Right" or "Left"
-                    score   = score + 3.0
+            -- b) Угол при достаточной дистанции: curl into corner
+            elseif dist > SPIN_SERVER_MIN_DIST and not wantsCrossGoal and isCorner then
+                spinDir = (localX >= 0) and "Left" or "Right"
+                score   = score + 1.8
 
-                -- b) Угол, дальние (>= 120): curl INTO corner
-                elseif dist >= MIN_SPIN_FAR_DIST and isCorner then
-                    spinDir = (localX >= 0) and "Left" or "Right"
-                    score   = score + 2.0
-
-                -- c) Любая дальняя цель >= 120
-                elseif dist >= MIN_SPIN_FAR_DIST then
-                    local goalDir  = (GoalCFrame.Position - startPos).Unit
-                    local fwdDir   = HumanoidRootPart.CFrame.LookVector
-                    local fwdAngle = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
-                    if fwdAngle < 35 then
-                        spinDir = localX >= 0 and "Left" or "Right"
-                        score   = score + 1.5
-                    end
+            -- c) Остальные дальние удары: лёгкий спин только если сервер вероятно примет его
+            elseif dist > SPIN_SERVER_MIN_DIST and not wantsCrossGoal then
+                local goalDir  = (GoalCFrame.Position - startPos).Unit
+                local fwdDir   = HumanoidRootPart.CFrame.LookVector
+                local fwdAngle = math.deg(math.acos(math.clamp(goalDir:Dot(fwdDir), -1, 1)))
+                if fwdAngle < 35 then
+                    spinDir = localX >= 0 and "Left" or "Right"
+                    score   = score + 1.2
                 end
             end
 
@@ -680,18 +684,23 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel)
             -- Clamp: центр мяча должен быть минимум BALL_RADIUS от внутреннего края штанги
             local safeEdge    = GoalWidth/2 - BALL_RADIUS
             local shootLocalX = math.clamp(localX + derivation, -safeEdge, safeEdge)
-            -- Целимся вглубь ворот гладкой функцией от дистанции: ближние ~1.4 stud, дальние ~4.6 stud.
-            -- Это помогает долёту и заставляет сервер видеть более далёкую цель для спина/свечек.
+            local shootLocalY = localY
+            -- Закрученные удары в игре приходят чуть ВЫШЕ ожидаемого, поэтому физически целимся немного ниже.
+            if spinDir ~= "None" then
+                local hFrac = localY / math.max(GoalHeight, 1)
+                local spinDrop = 0.10 + 0.24 * hFrac
+                shootLocalY = math.max(Y_BOT_INSET, localY - spinDrop)
+            end
+
+            -- Глубина ворот: для спина увеличиваем умеренно, чтобы сервер принял эффект,
+            -- но не настолько, чтобы мяч начинал системно не долетать по высоте/дальности.
             local depthAlpha  = 1 - math.exp(-dist / 95)
             local goalDepth   = GOAL_DEPTH_MIN + (GOAL_DEPTH_MAX - GOAL_DEPTH_MIN) * depthAlpha
             if spinDir ~= "None" then
-                goalDepth = goalDepth + 0.4  -- небольшая доп. глубина для регистрации сервером
-                -- Спин иногда добавляет вертикальный дрейф → штрафуем самые верхние цели
-                local spinHi = (localY / math.max(GoalHeight,1)) > 0.74
-                if spinHi then score = score - 4.5 end
+                goalDepth = goalDepth + 1.35
             end
             if isLobShot then goalDepth = goalDepth + 0.45 end
-            local shootPos    = GoalCFrame * Vector3.new(shootLocalX, localY, -goalDepth)
+            local shootPos    = GoalCFrame * Vector3.new(shootLocalX, shootLocalY, -goalDepth)
 
             -- *** БАЛЛИСТИКА: рассчитываем LaunchDir с учётом гравитации + трения ***
             local launchDir, horizD, flightT = CalcLaunchDir(startPos, shootPos)
@@ -967,10 +976,13 @@ local function CalculateTarget()
         Gui.Target.Text = string.format("→ X=%.1f Y=%.1f/%.1f", result.localX, result.localY, GoalHeight)
         local cosA_d = math.sqrt(result.launchDir.X^2 + result.launchDir.Z^2)
         local launchAngle = math.deg(math.atan(result.launchDir.Y / math.max(cosA_d, 0.01)))
+        local spinShown = (result.spin == "Right") and "CurveLeft"
+                          or (result.spin == "Left") and "CurveRight"
+                          or "None"
         Gui.Power.Text  = string.format("θ=%.1f° t=%.2fs %s | Spin=%s",
                             launchAngle, result.flightTime,
                             result.trajOk and "OK" or "!steep",
-                            result.spin)
+                            spinShown)
         Gui.Spin.Text   = string.format("V=%.0f k=%.2f drv=%.1f d=%.0f",
                             AutoShootBallSpeed, AutoShootDragComp, AutoShootDerivMult, dist)
         Gui.Goal.Text   = string.format("Goal W=%.1f H=%.1f floor=%.1f", GoalWidth, GoalHeight, GoalFloorY)
