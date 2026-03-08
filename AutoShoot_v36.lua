@@ -243,11 +243,10 @@ local function DrawTrajectory(startPos, peakPos, endPos, peakFrac, spinStr)
         else l.Visible = false end
     end
     local ringR = math.max(0.9, 0.70 + dist3D * 0.006)
-    local ringCF = CFrame.new(startPos) * CFrame.fromAxisAngle(fwdH, math.rad(90))
     local prev2D, prevOk = nil, false
     for i = 1, #StartCircle do
         local a = ((i-1) / #StartCircle) * math.pi * 2
-        local p = ringCF * Vector3.new(math.cos(a) * ringR, math.sin(a) * ringR, 0)
+        local p = startPos + Vector3.new(math.cos(a) * ringR, 0, math.sin(a) * ringR)
         local s, v = Camera:WorldToViewportPoint(p)
         local ok = v and s.Z > 0
         if i > 1 and prevOk and ok then
@@ -260,7 +259,7 @@ local function DrawTrajectory(startPos, peakPos, endPos, peakFrac, spinStr)
         end
         prev2D, prevOk = Vector2.new(s.X, s.Y), ok
     end
-    local firstP = ringCF * Vector3.new(ringR, 0, 0)
+    local firstP = startPos + Vector3.new(ringR, 0, 0)
     local fs, fv = Camera:WorldToViewportPoint(firstP)
     if prevOk and fv and fs.Z > 0 then
         local l = StartCircle[#StartCircle]
@@ -308,6 +307,20 @@ local function GetBallStartPos()
         if ballPart:IsA("Attachment") then return ballPart.WorldPosition end
     end
     return HumanoidRootPart.Position
+end
+
+-- Визуальный старт траектории: держим ниже, на уровне ног, и независимо от наклона/падения персонажа.
+-- Физика выстрела использует реальный мяч (GetBallStartPos), а рендер — стабильную точку у ног.
+local function GetVisualStartPos()
+    local hrp = HumanoidRootPart
+    if not hrp then return GetBallStartPos() end
+    local rootPos = hrp.Position
+    local footY = rootPos.Y - (Humanoid and (Humanoid.HipHeight + hrp.Size.Y * 0.5) or (hrp.Size.Y * 0.9))
+    local ballPos = GetBallStartPos()
+    local flatToBall = Vector3.new(ballPos.X - rootPos.X, 0, ballPos.Z - rootPos.Z)
+    local flatMag = flatToBall.Magnitude
+    local lateral = (flatMag > 0.01) and (flatToBall.Unit * math.min(flatMag, 1.8)) or Vector3.zero
+    return Vector3.new(rootPos.X + lateral.X, footY + 0.15, rootPos.Z + lateral.Z)
 end
 
 local GoalCFrame, GoalWidth, GoalHeight, GoalFloorY
@@ -1346,7 +1359,7 @@ AutoShoot.Start = function()
 
         -- 🟠 Траектория дуги (оранжевые линии) — главный визуал
         if ShowTrajectory and hasTarget and CurrentLaunchDir and CurrentFlightTime > 0 then
-            DrawTrajectory(GetBallStartPos(), CurrentPeakPos, PredictedLand, CurrentPeakFrac, CurrentSpin)
+            DrawTrajectory(GetVisualStartPos(), CurrentPeakPos, PredictedLand, CurrentPeakFrac, CurrentSpin)
         else
             for _, l in ipairs(TrajectoryLines) do l.Visible = false end
             for _, l in ipairs(StartCircle) do l.Visible = false end
