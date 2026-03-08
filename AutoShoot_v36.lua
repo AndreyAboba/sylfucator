@@ -1,6 +1,5 @@
 -- [v36.0] AUTO SHOOT + AUTO PICKUP — Smart GK-aware, zero manual config
 local Players = game:GetService("Players")
-print('9')
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -64,7 +63,7 @@ local Y_TOP_TARGET         = BALL_RADIUS + 0.28   -- 1.45 studs от перек�
 local Y_TOP_SAFETY         = BALL_RADIUS + 0.48   -- 1.65 studs порог штрафа
 local Y_BOT_INSET          = 0.22                 -- studs от пола
 local GOAL_DEPTH_MIN         = 1.0                  -- минимально целимся внутрь ворот
-local GOAL_DEPTH_MAX         = 1.35                 -- максимально целимся вглубь на дальних
+local GOAL_DEPTH_MAX         = 1.15                 -- максимально целимся вглубь на дальних
 local VIS_CURL_MAX           = 1.45                 -- max визуальный боковой Magnus изгиб
 local VIS_CURL_PEAK          = 0.38                 -- пик Magnus-изгиба раньше середины
 local VIS_FALL_EARLY_BIAS    = 0.92                 -- падение начинается чуть раньше, чем симм. дуга
@@ -501,7 +500,7 @@ local function CalcLaunchDir(startPos, targetPos)
     local baseComp = (0.5 * GRAVITY + 0.19 * k * V) * t * t * gravRamp
     local t2       = t * t
     local s        = t2 / (t2 + 0.80 * 0.80)
-    local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.34 * s * s * s
+    local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.46 * s * s * s
     local upDy     = math.max(targetPos.Y - startPos.Y, 0)
     local nearRise = upDy * 0.78 * math.exp(-(t / 0.34) ^ 2)
     local corrY    = targetPos.Y + baseComp * farScale - nearRise
@@ -757,7 +756,8 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             -- Закрученные удары в игре приходят чуть ВЫШЕ ожидаемого, поэтому физически целимся немного ниже.
             if spinDir ~= "None" then
                 local hFrac = localY / math.max(GoalHeight, 1)
-                local spinDrop = 0.10 + 0.24 * hFrac
+                local dFrac = dist / (dist + 120)
+                local spinDrop = 0.14 + 0.30 * hFrac + 0.08 * dFrac
                 shootLocalY = math.max(Y_BOT_INSET, localY - spinDrop)
             end
 
