@@ -594,7 +594,7 @@ local function CalcLaunchDir(startPos, targetPos)
     local baseComp = (0.5 * GRAVITY + 0.19 * k * V) * t * t * gravRamp
     local t2       = t * t
     local s        = t2 / (t2 + 0.80 * 0.80)
-    local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.57 * s * s * s
+    local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.51 * s * s * s
     local upDy     = math.max(targetPos.Y - startPos.Y, 0)
     local nearRise = upDy * 0.68 * math.exp(-(t / 0.34) ^ 2)
     local corrY    = targetPos.Y + baseComp * farScale - nearRise
@@ -707,11 +707,13 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
 
             local hFrac = localY / math.max(yRange, 1)
             -- Мягкий бонус за высоту: верх полезен, но не должен доминировать всегда
-            score = score + hFrac * 0.9
+            score = score + hFrac * 0.75
             -- Только на дальних реально поощряем высокие цели
-            score = score + hFrac * math.clamp((dist - 105) / 70, 0, 1) * 1.7
+            score = score + hFrac * math.clamp((dist - 120) / 85, 0, 1) * 1.15
             -- На ближних и средних сильнее штрафуем слишком верхние цели
             score = score - hFrac * hFrac * math.clamp((85 - dist) / 40, 0, 1) * 3.8
+            -- В зоне 100-150 без спина высокие точки часто приходят выше нужного → мягко прижимаем выбор вниз
+            local midNoSpinHighPenalty = hFrac * math.clamp((dist - 100) / 50, 0, 1) * math.clamp((155 - dist) / 55, 0, 1) * 2.4
             if isLobShot and dist > 95 then score = score + 4.0 end
 
             -- Навес: ценен когда GK низко или выходит вперёд
@@ -733,13 +735,14 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             local isFarCorner = (playerLocalX > halfW*0.2 and localX < -halfW*0.4)
                              or (playerLocalX < -halfW*0.2 and localX >  halfW*0.4)
             if gkIsNPC then
-                -- NPC не нужно обманывать спином: просто бьём в самые трудные не-spin точки,
-                -- но держим их НИЖЕ, потому что против NPC верхние 100-150 studs часто лезут в перекладину.
+                -- NPC не нужно обманывать спином: просто бьём в самые трудные не-spin точки.
                 score = score + pgkDist2D * 1.55 + math.abs(localX) * 0.45
-                if isTopCorner then score = score + 0.5 end
-                if isCorner then score = score + 1.1 end
-                score = score - hFrac * math.clamp((dist - 95) / 55, 0, 1) * 3.1
+                if isTopCorner then score = score + 0.7 end
+                if isCorner then score = score + 1.3 end
+                score = score - hFrac * math.clamp((dist - 110) / 55, 0, 1) * 3.0
+                score = score - midNoSpinHighPenalty * 1.2
             else
+                score = score - midNoSpinHighPenalty
                 if isFarCorner then score = score + 3.5 end
                 -- Паттерны вратаря: если он системно сидит с одной стороны или смещается,
                 -- то противоположная сторона и фейковые траектории получают бонус.
@@ -853,15 +856,16 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             local safeEdge    = GoalWidth/2 - BALL_RADIUS
             local shootLocalX = math.clamp(localX + derivation, -safeEdge, safeEdge)
             local shootLocalY = localY
-            if gkIsNPC then
-                local npcLower = 0.08 + 0.20 * hFrac * math.clamp((dist - 90) / 70, 0, 1)
-                shootLocalY = math.max(Y_BOT_INSET, shootLocalY - npcLower)
-            end
             -- Закрученные удары в игре приходят чуть ВЫШЕ ожидаемого, поэтому физически целимся немного ниже.
             if spinDir ~= "None" then
                 local hFrac = localY / math.max(GoalHeight, 1)
                 local spinDrop = 0.18 + 0.34 * hFrac
                 shootLocalY = math.max(Y_BOT_INSET, localY - spinDrop)
+            else
+                local midBand = math.clamp((dist - 100) / 45, 0, 1) * math.clamp((155 - dist) / 55, 0, 1)
+                local npcBand = gkIsNPC and 1 or 0
+                local noSpinDrop = (0.09 + 0.16 * hFrac) * midBand * (1.0 + 0.35 * npcBand)
+                shootLocalY = math.max(Y_BOT_INSET, localY - noSpinDrop)
             end
 
             -- Глубина ворот: для спина увеличиваем умеренно, чтобы сервер принял эффект,
