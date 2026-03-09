@@ -733,11 +733,12 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             local isFarCorner = (playerLocalX > halfW*0.2 and localX < -halfW*0.4)
                              or (playerLocalX < -halfW*0.2 and localX >  halfW*0.4)
             if gkIsNPC then
-                -- NPC не нужно обманывать спином: просто бьём в самые трудные не-spin точки.
+                -- NPC не нужно обманывать спином: просто бьём в самые трудные не-spin точки,
+                -- но держим их НИЖЕ, потому что против NPC верхние 100-150 studs часто лезут в перекладину.
                 score = score + pgkDist2D * 1.55 + math.abs(localX) * 0.45
-                if isTopCorner then score = score + 1.2 end
-                if isCorner then score = score + 1.3 end
-                score = score - hFrac * math.clamp((dist - 120) / 60, 0, 1) * 2.2
+                if isTopCorner then score = score + 0.5 end
+                if isCorner then score = score + 1.1 end
+                score = score - hFrac * math.clamp((dist - 95) / 55, 0, 1) * 3.1
             else
                 if isFarCorner then score = score + 3.5 end
                 -- Паттерны вратаря: если он системно сидит с одной стороны или смещается,
@@ -852,6 +853,10 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             local safeEdge    = GoalWidth/2 - BALL_RADIUS
             local shootLocalX = math.clamp(localX + derivation, -safeEdge, safeEdge)
             local shootLocalY = localY
+            if gkIsNPC then
+                local npcLower = 0.08 + 0.20 * hFrac * math.clamp((dist - 90) / 70, 0, 1)
+                shootLocalY = math.max(Y_BOT_INSET, shootLocalY - npcLower)
+            end
             -- Закрученные удары в игре приходят чуть ВЫШЕ ожидаемого, поэтому физически целимся немного ниже.
             if spinDir ~= "None" then
                 local hFrac = localY / math.max(GoalHeight, 1)
