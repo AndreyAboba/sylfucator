@@ -1,4 +1,4 @@
--- [v3.1] AUTO DRIBBLE + AUTO TACKLE
+-- [v4.0] AUTO DRIBBLE + AUTO TACKLE — Server Position Prediction
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -7,7 +7,7 @@ local Camera = Workspace.CurrentCamera
 local UserInputService = game:GetService("UserInputService")
 local Debris = game:GetService("Debris")
 local Stats = game:GetService("Stats")
-print('9')
+
 local LocalPlayer = Players.LocalPlayer
 local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
 local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
@@ -41,12 +41,12 @@ end
 -- === CONFIG ===
 local AutoTackleConfig = {
     Enabled = false,
-    Mode = "OnlyDribble", -- "OnlyDribble", "EagleEye", "ManualTackle"
+    Mode = "OnlyDribble",
     MaxDistance = 20,
     TackleDistance = 0,
     TackleSpeed = 47,
     OnlyPlayer = true,
-    RotationMethod = "Snap", -- "Snap", "Always", "None"
+    RotationMethod = "Snap",
     DribbleDelayTime = 0.63,
     EagleEyeMinDelay = 0.1,
     EagleEyeMaxDelay = 0.6,
@@ -61,8 +61,10 @@ local AutoDribbleConfig = {
     Enabled = false,
     MaxDribbleDistance = 30,
     DribbleActivationDistance = 16,
-    MinAngleForDribble = 30,      -- Минимальный угол атаки такля в нас (чем меньше — строже)
-    HeadOnAngleThreshold = 45,    -- Угол для "head-on" детекции
+    MinAngleForDribble = 30,
+    HeadOnAngleThreshold = 45,
+    -- НОВОЕ: компенсация серверной позиции
+    UseServerPosition = true,
 }
 
 local DebugConfig = {
@@ -84,8 +86,7 @@ local AutoTackleStatus = {
     StartPos = UDim2.new(0, 0, 0, 0),
     Ping = 0.1,
     LastPingUpdate = 0,
-    -- История позиций для Position-Based предикта
-    TargetPositionHistory = {}, -- [player] = { {time, pos}, ... }
+    TargetPositionHistory = {},
     TargetCircles = {}
 }
 
@@ -103,31 +104,64 @@ local TackleStates = {}
 local PrecomputedPlayers = {}
 local HasBall = false
 local CanDribbleNow = false
--- DribbleCooldownList[player] = expireTime — игрок использовал дриббл, задержка прошла, готовы к таклу
 local DribbleCooldownList = {}
 local EagleEyeTimers = {}
 local IsTypingInChat = false
 local LastManualTackleTime = 0
 local CurrentTargetOwner = nil
 
+-- НОВОЕ: история ТВОЕЙ позиции для серверной предикции
+local MyPositionHistory = {}
+
 local SPECIFIC_TACKLE_ID = "rbxassetid://14317040670"
 
 -- ============================================================
--- === ПРЕДИКТ ПОЗИЦИИ — Intercept-based
--- Алгоритм:
--- 1) История позиций врага (position-based velocity, устойчива
---    к fake-outs — резкая остановка отражается за ~0.1с)
--- 2) Компенсация пинга: позиция у нас "устаревшая" на ping сек,
---    значит враг УЖЕ ушёл вперёд → прибавляем vel*ping
--- 3) Решаем задачу перехвата (intercept):
---    |myPos - (serverPos + vel*t)| = TackleSpeed * t
---    Квадратное уравнение → берём минимальное t > 0
--- ВАЖНО: RecordTargetPosition вызывается каждый кадр из
--- PrecomputePlayers, а не только при такле!
+-- === ИСТОРИЯ ПОЗИЦИЙ (Position-Based Velocity)
 -- ============================================================
-local HISTORY_SIZE   = 8
-local HISTORY_WINDOW = 0.1 -- секунды; короткое окно = быстрая реакция на торможение
+local HISTORY_SIZE = 10
+local HISTORY_WINDOW = 0.12
 
+-- Записываем ТВОЮ позицию каждый кадр
+local function RecordMyPosition()
+    table.insert(MyPositionHistory, { time = tick(), pos = HumanoidRootPart.Position })
+    while #MyPositionHistory > HISTORY_SIZE do table.remove(MyPositionHistory, 1) end
+end
+
+-- Вычисляем ТВОЮ velocity из истории
+local function GetMyPositionBasedVelocity()
+    if #MyPositionHistory < 2 then return Vector3.zero end
+    local now = tick()
+    local oldest, newest = nil, nil
+    for _, pt in ipairs(MyPositionHistory) do
+        if now - pt.time <= HISTORY_WINDOW then
+            if not oldest then oldest = pt end
+            newest = pt
+        end
+    end
+    if not oldest or oldest == newest then
+        if #MyPositionHistory >= 2 then
+            oldest = MyPositionHistory[#MyPositionHistory - 1]
+            newest = MyPositionHistory[#MyPositionHistory]
+        else
+            return Vector3.zero
+        end
+    end
+    local dt = newest.time - oldest.time
+    if dt < 0.001 then return Vector3.zero end
+    return (newest.pos - oldest.pos) / dt
+end
+
+-- Вычисляем ТВОЮ серверную позицию (где тебя видит сервер)
+local function GetMyServerPosition()
+    local ping = AutoTackleStatus.Ping
+    local myVel = GetMyPositionBasedVelocity()
+    local flatVel = Vector3.new(myVel.X, 0, myVel.Z)
+    -- Сервер видит тебя на ping секунд НАЗАД
+    -- Значит твоя серверная позиция = текущая - vel * ping
+    return HumanoidRootPart.Position - flatVel * ping
+end
+
+-- Записываем позицию врага
 local function RecordTargetPosition(ownerRoot, player)
     local history = AutoTackleStatus.TargetPositionHistory[player]
     if not history then
@@ -138,11 +172,11 @@ local function RecordTargetPosition(ownerRoot, player)
     while #history > HISTORY_SIZE do table.remove(history, 1) end
 end
 
+-- Вычисляем velocity врага из истории
 local function GetPositionBasedVelocity(player)
     local history = AutoTackleStatus.TargetPositionHistory[player]
     if not history or #history < 2 then return Vector3.zero end
     local now = tick()
-    -- Берём только свежие точки в пределах HISTORY_WINDOW
     local oldest, newest = nil, nil
     for _, pt in ipairs(history) do
         if now - pt.time <= HISTORY_WINDOW then
@@ -151,7 +185,6 @@ local function GetPositionBasedVelocity(player)
         end
     end
     if not oldest or oldest == newest then
-        -- Fallback на последние 2 точки если свежих мало
         if #history >= 2 then
             oldest = history[#history - 1]
             newest = history[#history]
@@ -164,27 +197,26 @@ local function GetPositionBasedVelocity(player)
     return (newest.pos - oldest.pos) / dt
 end
 
--- Вычисляет время перехвата (intercept time) методом квадратного уравнения.
--- Возвращает время в секундах за которое объект скоростью speed достигнет
--- точки targetPos движущейся со скоростью vel, стартуя из fromPos.
+-- ============================================================
+-- === INTERCEPT PREDICTION (для AutoTackle)
+-- ============================================================
 local function CalcInterceptTime(fromPos, targetPos, vel, speed)
     local toTarget = targetPos - fromPos
     local dist = toTarget.Magnitude
     if dist < 0.01 then return 0 end
-    local v2   = vel:Dot(vel)
-    local ts2  = speed * speed
+    local v2 = vel:Dot(vel)
+    local ts2 = speed * speed
     local dotDV = toTarget:Dot(vel)
     local a = ts2 - v2
     local b = -2 * dotDV
     local c = -(dist * dist)
     local t
     if math.abs(a) < 0.001 then
-        -- Скорость такла = скорость цели: линейное решение
         t = (math.abs(b) > 0.001) and (-c / b) or (dist / math.max(speed, 1))
     else
         local disc = b * b - 4 * a * c
         if disc < 0 then
-            t = dist / math.max(speed, 1) -- не догнать — летим напрямую
+            t = dist / math.max(speed, 1)
         else
             local sqrtD = math.sqrt(disc)
             local t1 = (-b - sqrtD) / (2 * a)
@@ -198,22 +230,21 @@ local function CalcInterceptTime(fromPos, targetPos, vel, speed)
     return math.clamp(t, 0.02, 0.5)
 end
 
--- Вычисляет предиктованную позицию. Не обновляет GUI — GUI обновляется отдельно каждый кадр.
+-- Предикция позиции врага для AutoTackle
 local function PredictTargetPosition(ownerRoot, player)
     if not ownerRoot then return ownerRoot.Position end
-
-    local ping    = AutoTackleStatus.Ping
-    local vel     = GetPositionBasedVelocity(player)
+    local ping = AutoTackleStatus.Ping
+    local vel = GetPositionBasedVelocity(player)
     local flatVel = Vector3.new(vel.X, 0, vel.Z)
-
-    -- Компенсация пинга: враг уже ушёл вперёд
     local serverPos = ownerRoot.Position + flatVel * ping
-
-    local myPos2D  = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
+    
+    -- Используем СЕРВЕРНУЮ позицию для расчёта intercept
+    local myServerPos = GetMyServerPosition()
+    local myPos2D = Vector3.new(myServerPos.X, 0, myServerPos.Z)
     local target2D = Vector3.new(serverPos.X, 0, serverPos.Z)
-
+    
     local interceptT = CalcInterceptTime(myPos2D, target2D, flatVel, AutoTackleConfig.TackleSpeed)
-
+    
     return Vector3.new(
         serverPos.X + flatVel.X * interceptT,
         serverPos.Y,
@@ -221,24 +252,22 @@ local function PredictTargetPosition(ownerRoot, player)
     )
 end
 
--- Обновляет PredictionLabel каждый кадр для текущего owner.
--- Вызывается из основного Heartbeat-цикла, НЕ только при такле.
+-- Обновляет PredictionLabel
 local function UpdatePredictionLabel(ownerRoot, player)
     if not Gui or not DebugConfig.Enabled or not AutoTackleConfig.Enabled then return end
     if not ownerRoot or not player then
         Gui.PredictionLabel.Text = "Pred: no target"
         return
     end
-    local ping    = AutoTackleStatus.Ping
-    local vel     = GetPositionBasedVelocity(player)
+    local ping = AutoTackleStatus.Ping
+    local vel = GetPositionBasedVelocity(player)
     local flatVel = Vector3.new(vel.X, 0, vel.Z)
-    local serverPos  = ownerRoot.Position + flatVel * ping
-    local myPos2D    = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
-    local target2D   = Vector3.new(serverPos.X, 0, serverPos.Z)
-    -- Дистанция от нас до серверной позиции цели
-    local dist       = (target2D - myPos2D).Magnitude
+    local serverPos = ownerRoot.Position + flatVel * ping
+    local myServerPos = GetMyServerPosition()
+    local myPos2D = Vector3.new(myServerPos.X, 0, myServerPos.Z)
+    local target2D = Vector3.new(serverPos.X, 0, serverPos.Z)
+    local dist = (target2D - myPos2D).Magnitude
     local interceptT = CalcInterceptTime(myPos2D, target2D, flatVel, AutoTackleConfig.TackleSpeed)
-    -- Показываем: пинг | intercept time | скорость цели | дистанция
     Gui.PredictionLabel.Text = string.format(
         "p=%dms t=%dms v=%.0f d=%.0f",
         math.round(ping * 1000),
@@ -264,24 +293,25 @@ end
 local Gui = nil
 local function SetupGUI()
     Gui = {
-        TackleWaitLabel     = Drawing.new("Text"),
-        TackleTargetLabel   = Drawing.new("Text"),
+        TackleWaitLabel = Drawing.new("Text"),
+        TackleTargetLabel = Drawing.new("Text"),
         TackleDribblingLabel = Drawing.new("Text"),
-        TackleTacklingLabel  = Drawing.new("Text"),
-        EagleEyeLabel       = Drawing.new("Text"),
-        DribbleStatusLabel  = Drawing.new("Text"),
-        DribbleTargetLabel  = Drawing.new("Text"),
+        TackleTacklingLabel = Drawing.new("Text"),
+        EagleEyeLabel = Drawing.new("Text"),
+        DribbleStatusLabel = Drawing.new("Text"),
+        DribbleTargetLabel = Drawing.new("Text"),
         DribbleTacklingLabel = Drawing.new("Text"),
-        AutoDribbleLabel    = Drawing.new("Text"),
-        CooldownListLabel   = Drawing.new("Text"),
-        ModeLabel           = Drawing.new("Text"),
-        ManualTackleLabel   = Drawing.new("Text"),
-        PingLabel           = Drawing.new("Text"),
-        AngleLabel          = Drawing.new("Text"),
-        PredictionLabel     = Drawing.new("Text"),
-        TargetRingLines     = {},
-        TackleDebugLabels   = {},
-        DribbleDebugLabels  = {}
+        AutoDribbleLabel = Drawing.new("Text"),
+        CooldownListLabel = Drawing.new("Text"),
+        ModeLabel = Drawing.new("Text"),
+        ManualTackleLabel = Drawing.new("Text"),
+        PingLabel = Drawing.new("Text"),
+        AngleLabel = Drawing.new("Text"),
+        PredictionLabel = Drawing.new("Text"),
+        ServerPosLabel = Drawing.new("Text"), -- НОВОЕ: показывает серверную позицию
+        TargetRingLines = {},
+        TackleDebugLabels = {},
+        DribbleDebugLabels = {}
     }
 
     local screenSize = Camera.ViewportSize
@@ -293,7 +323,8 @@ local function SetupGUI()
     local tackleLabels = {
         Gui.TackleWaitLabel, Gui.TackleTargetLabel, Gui.TackleDribblingLabel,
         Gui.TackleTacklingLabel, Gui.EagleEyeLabel, Gui.CooldownListLabel,
-        Gui.ModeLabel, Gui.ManualTackleLabel, Gui.PingLabel, Gui.AngleLabel, Gui.PredictionLabel
+        Gui.ModeLabel, Gui.ManualTackleLabel, Gui.PingLabel, Gui.AngleLabel,
+        Gui.PredictionLabel, Gui.ServerPosLabel
     }
     for _, label in ipairs(tackleLabels) do
         label.Size = 16; label.Color = Color3.fromRGB(255, 255, 255)
@@ -303,17 +334,18 @@ local function SetupGUI()
     end
 
     Gui.TackleWaitLabel.Color = Color3.fromRGB(255, 165, 0)
-    Gui.TackleWaitLabel.Position    = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
-    Gui.TackleTargetLabel.Position  = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
+    Gui.TackleWaitLabel.Position = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
+    Gui.TackleTargetLabel.Position = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
     Gui.TackleDribblingLabel.Position = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
-    Gui.TackleTacklingLabel.Position  = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
-    Gui.EagleEyeLabel.Position      = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
-    Gui.CooldownListLabel.Position  = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
-    Gui.ModeLabel.Position          = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
-    Gui.ManualTackleLabel.Position  = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
-    Gui.PingLabel.Position          = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
-    Gui.AngleLabel.Position         = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
-    Gui.PredictionLabel.Position    = Vector2.new(centerX, offsetTackleY)
+    Gui.TackleTacklingLabel.Position = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
+    Gui.EagleEyeLabel.Position = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
+    Gui.CooldownListLabel.Position = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
+    Gui.ModeLabel.Position = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
+    Gui.ManualTackleLabel.Position = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
+    Gui.PingLabel.Position = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
+    Gui.AngleLabel.Position = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
+    Gui.PredictionLabel.Position = Vector2.new(centerX, offsetTackleY); offsetTackleY += 15
+    Gui.ServerPosLabel.Position = Vector2.new(centerX, offsetTackleY)
 
     local dribbleLabels = {
         Gui.DribbleStatusLabel, Gui.DribbleTargetLabel,
@@ -326,26 +358,27 @@ local function SetupGUI()
         table.insert(Gui.DribbleDebugLabels, label)
     end
 
-    Gui.DribbleStatusLabel.Position  = Vector2.new(centerX, offsetDribbleY); offsetDribbleY += 15
-    Gui.DribbleTargetLabel.Position  = Vector2.new(centerX, offsetDribbleY); offsetDribbleY += 15
+    Gui.DribbleStatusLabel.Position = Vector2.new(centerX, offsetDribbleY); offsetDribbleY += 15
+    Gui.DribbleTargetLabel.Position = Vector2.new(centerX, offsetDribbleY); offsetDribbleY += 15
     Gui.DribbleTacklingLabel.Position = Vector2.new(centerX, offsetDribbleY); offsetDribbleY += 15
-    Gui.AutoDribbleLabel.Position    = Vector2.new(centerX, offsetDribbleY)
+    Gui.AutoDribbleLabel.Position = Vector2.new(centerX, offsetDribbleY)
 
-    Gui.TackleWaitLabel.Text   = "Wait: 0.00"
+    Gui.TackleWaitLabel.Text = "Wait: 0.00"
     Gui.TackleTargetLabel.Text = "Target: None"
     Gui.TackleDribblingLabel.Text = "isDribbling: false"
-    Gui.TackleTacklingLabel.Text  = "isTackling: false"
-    Gui.EagleEyeLabel.Text     = "EagleEye: Idle"
+    Gui.TackleTacklingLabel.Text = "isTackling: false"
+    Gui.EagleEyeLabel.Text = "EagleEye: Idle"
     Gui.CooldownListLabel.Text = "CooldownList: 0"
-    Gui.ModeLabel.Text         = "Mode: " .. AutoTackleConfig.Mode
+    Gui.ModeLabel.Text = "Mode: " .. AutoTackleConfig.Mode
     Gui.ManualTackleLabel.Text = "ManualTackle: Ready [" .. tostring(AutoTackleConfig.ManualTackleKeybind) .. "]"
-    Gui.PingLabel.Text         = "Ping: 0ms"
-    Gui.AngleLabel.Text        = "Angle: -"
-    Gui.PredictionLabel.Text   = "Pred: 0ms"
-    Gui.DribbleStatusLabel.Text  = "Dribble: Ready"
-    Gui.DribbleTargetLabel.Text  = "Targets: 0"
+    Gui.PingLabel.Text = "Ping: 0ms"
+    Gui.AngleLabel.Text = "Angle: -"
+    Gui.PredictionLabel.Text = "Pred: 0ms"
+    Gui.ServerPosLabel.Text = "SrvPos: OK"
+    Gui.DribbleStatusLabel.Text = "Dribble: Ready"
+    Gui.DribbleTargetLabel.Text = "Targets: 0"
     Gui.DribbleTacklingLabel.Text = "Nearest: None"
-    Gui.AutoDribbleLabel.Text  = "AutoDribble: Idle"
+    Gui.AutoDribbleLabel.Text = "AutoDribble: Idle"
 
     for i = 1, 24 do
         local line = Drawing.new("Line")
@@ -377,6 +410,7 @@ local function CleanupDebugText()
         Gui.ManualTackleLabel.Text = "ManualTackle: Ready [" .. tostring(AutoTackleConfig.ManualTackleKeybind) .. "]"
         Gui.ModeLabel.Text = "Mode: " .. AutoTackleConfig.Mode
         Gui.PingLabel.Text = "Ping: 0ms"; Gui.PredictionLabel.Text = "Pred: 0ms"
+        Gui.ServerPosLabel.Text = "SrvPos: OK"
     end
     if not AutoDribbleConfig.Enabled then
         Gui.DribbleStatusLabel.Text = "Dribble: Ready"; Gui.DribbleTargetLabel.Text = "Targets: 0"
@@ -610,19 +644,16 @@ local function UpdateDribbleStates()
         local state = DribbleStates[player]
         local isDribblingNow = IsDribbling(player)
         if isDribblingNow and not state.IsDribbling then
-            -- Дриббл начался
             state.IsDribbling = true
             state.IsProcessingDelay = false
             state.HadDribble = true
         elseif not isDribblingNow and state.IsDribbling then
-            -- Дриббл закончился — начинаем отсчёт задержки
             state.IsDribbling = false
             state.LastDribbleEnd = currentTime
             state.IsProcessingDelay = true
         elseif state.IsProcessingDelay and not isDribblingNow then
             local timeSinceEnd = currentTime - state.LastDribbleEnd
             if timeSinceEnd >= AutoTackleConfig.DribbleDelayTime then
-                -- Задержка прошла — добавляем в список "можно таклить"
                 DribbleCooldownList[player] = currentTime + 3.5
                 state.IsProcessingDelay = false
             end
@@ -673,13 +704,12 @@ local function PrecomputePlayers()
         local distance = (targetRoot.Position - HumanoidRootPart.Position).Magnitude
         if distance > AutoDribbleConfig.MaxDribbleDistance then continue end
         PrecomputedPlayers[player] = {
-            Distance   = distance,
-            IsValid    = true,
+            Distance = distance,
+            IsValid = true,
             IsTackling = TackleStates[player].IsTackling,
-            RootPart   = targetRoot,
-            Velocity   = targetRoot.AssemblyLinearVelocity
+            RootPart = targetRoot,
+            Velocity = targetRoot.AssemblyLinearVelocity
         }
-        -- Записываем позицию КАЖДЫЙ КАДР чтобы история была свежей к моменту такла
         RecordTargetPosition(targetRoot, player)
     end
 end
@@ -726,8 +756,6 @@ local function PerformTackle(ball, owner)
        (Character:FindFirstChild("Bools") and Character.Bools.Debounce.Value) then return end
 
     local ownerRoot = owner and owner.Character and owner.Character:FindFirstChild("HumanoidRootPart")
-
-    -- Position-based предикт
     local predictedPos
     if ownerRoot and owner then
         predictedPos = PredictTargetPosition(ownerRoot, owner)
@@ -735,10 +763,8 @@ local function PerformTackle(ball, owner)
         predictedPos = ball.Position
     end
 
-    -- Ротируемся к предикт-позиции
     RotateToTarget(predictedPos)
 
-    -- firetouchinterest только если враг близко (<=10 studs) и скрипт активно таклит
     if ownerRoot then
         local ftiDist = (HumanoidRootPart.Position - ownerRoot.Position).Magnitude
         if ftiDist <= 10 then
@@ -757,7 +783,6 @@ local function PerformTackle(ball, owner)
     local tackleStartTime = tick()
     local tackleDuration = 0.65
 
-    -- В режиме "Always" продолжаем следить за целью в полёте
     local rotateConnection
     if AutoTackleConfig.RotationMethod == "Always" and ownerRoot and owner then
         rotateConnection = RunService.Heartbeat:Connect(function()
@@ -820,9 +845,16 @@ AutoTackle.Start = function()
     AutoTackleStatus.HeartbeatConnection = RunService.Heartbeat:Connect(function()
         pcall(UpdatePing)
         pcall(UpdateDribbleStates)
+        pcall(RecordMyPosition) -- НОВОЕ: записываем свою позицию каждый кадр
         pcall(PrecomputePlayers)
         pcall(UpdateTargetCircles)
         IsTypingInChat = CheckIfTypingInChat()
+        
+        -- НОВОЕ: обновляем ServerPosLabel
+        if Gui and AutoTackleConfig.Enabled then
+            local myVel = GetMyPositionBasedVelocity()
+            Gui.ServerPosLabel.Text = string.format("MyVel: %.1f", myVel.Magnitude)
+        end
     end)
 
     AutoTackleStatus.InputConnection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
@@ -854,24 +886,21 @@ AutoTackle.Start = function()
             if Gui then
                 Gui.TackleTargetLabel.Text = "Target: " .. (owner and owner.Name or "None")
                 Gui.TackleDribblingLabel.Text = "isDribbling: " .. tostring(owner and DribbleStates[owner] and DribbleStates[owner].IsDribbling or false)
-                Gui.TackleTacklingLabel.Text  = "isTackling: " .. tostring(owner and IsSpecificTackle(owner) or false)
+                Gui.TackleTacklingLabel.Text = "isTackling: " .. tostring(owner and IsSpecificTackle(owner) or false)
                 Gui.PingLabel.Text = string.format("Ping: %dms", math.round(AutoTackleStatus.Ping * 1000))
             end
 
-            -- Обновляем prediction label каждый кадр (не только при такле)
             if owner then
                 local ownerRootLive = owner.Character and owner.Character:FindFirstChild("HumanoidRootPart")
                 UpdatePredictionLabel(ownerRootLive, owner)
             end
 
-            -- Instant Tackle Distance
             if distance <= AutoTackleConfig.TackleDistance then
                 PerformTackle(ball, owner)
                 if Gui then Gui.EagleEyeLabel.Text = "Instant Tackle" end
                 return
             end
 
-            -- PowerShooting — немедленный такл во всех режимах
             if owner and IsPowerShooting(owner) then
                 PerformTackle(ball, owner)
                 if Gui then Gui.EagleEyeLabel.Text = "PowerShooting: Tackling!" end
@@ -895,24 +924,16 @@ AutoTackle.Start = function()
             local isDribbling = state.IsDribbling
             local inCooldownList = DribbleCooldownList[owner] ~= nil
 
-            -- ==================================================
-            -- OnlyDribble:
-            -- Ждём начала дриббла → ждём его конца + DribbleDelay → таклим
-            -- inCooldownList означает что дриббл был и задержка уже прошла
-            -- ==================================================
             if AutoTackleConfig.Mode == "OnlyDribble" then
                 if inCooldownList then
-                    -- Задержка после дриббла прошла — таклим
                     PerformTackle(ball, owner)
                     if Gui then Gui.EagleEyeLabel.Text = "OnlyDribble: Tackling!" end
                 elseif isDribbling then
-                    -- Враг сейчас дриблит — ждём конца
                     if Gui then
                         Gui.EagleEyeLabel.Text = "OnlyDribble: Dribbling..."
                         Gui.TackleWaitLabel.Text = string.format("DDelay: %.2f", AutoTackleConfig.DribbleDelayTime)
                     end
                 elseif state.IsProcessingDelay then
-                    -- Дриббл закончился, идёт отсчёт задержки
                     local elapsed = tick() - state.LastDribbleEnd
                     local remaining = AutoTackleConfig.DribbleDelayTime - elapsed
                     if Gui then
@@ -920,24 +941,16 @@ AutoTackle.Start = function()
                         Gui.TackleWaitLabel.Text = string.format("Wait: %.2f", remaining)
                     end
                 else
-                    -- Ждём дриббла
                     if Gui then
                         Gui.EagleEyeLabel.Text = "OnlyDribble: Waiting dribble"
                         Gui.TackleWaitLabel.Text = "Wait: -"
                     end
                 end
 
-            -- ==================================================
-            -- EagleEye:
-            -- Если не дриблит — рандомный таймер [Min, Max], по истечении — такл.
-            -- Если начал дриббл — сбрасываем таймер.
-            -- После конца дриббла — ждём DribbleDelay, потом таклим.
-            -- ==================================================
             elseif AutoTackleConfig.Mode == "EagleEye" then
                 local currentTime = tick()
 
                 if isDribbling then
-                    -- Дриббл идёт — сброс таймера, ждём конца дриббла + DribbleDelay
                     EagleEyeTimers[owner] = nil
                     if Gui then
                         Gui.TackleWaitLabel.Text = "Wait: DRIBBLE"
@@ -945,7 +958,6 @@ AutoTackle.Start = function()
                     end
 
                 elseif state.IsProcessingDelay then
-                    -- Дриббл закончился, идём в DribbleDelay
                     EagleEyeTimers[owner] = nil
                     local elapsed = currentTime - state.LastDribbleEnd
                     local remaining = AutoTackleConfig.DribbleDelayTime - elapsed
@@ -955,13 +967,11 @@ AutoTackle.Start = function()
                     end
 
                 elseif inCooldownList then
-                    -- DribbleDelay прошёл — немедленный такл
                     PerformTackle(ball, owner)
                     EagleEyeTimers[owner] = nil
                     if Gui then Gui.EagleEyeLabel.Text = "EagleEye: Post-Dribble Tackle!" end
 
                 else
-                    -- Обычный режим: рандомный таймер
                     if not EagleEyeTimers[owner] then
                         local waitTime = AutoTackleConfig.EagleEyeMinDelay +
                             math.random() * (AutoTackleConfig.EagleEyeMaxDelay - AutoTackleConfig.EagleEyeMinDelay)
@@ -1006,38 +1016,39 @@ AutoTackle.Stop = function()
 end
 
 -- ==========================================================
--- === AUTODRIBBLE MODULE
+-- === AUTODRIBBLE MODULE (СЕРВЕРНАЯ ПОЗИЦИЯ)
 -- ==========================================================
--- Для точности AutoDribble мы теперь проверяем:
--- 1. Таклер действительно активно движется к нам (position-based velocity из истории)
--- 2. Угол атаки достаточно мал (таклер смотрит в нашу сторону)
--- 3. Время до столкновения < порога
--- Это отсекает ситуации когда враг таклит не в нас или делает fake-tackle
+-- Ключевое изменение: теперь проверяем столкновение между
+-- СЕРВЕРНОЙ позицией врага и ТВОЕЙ СЕРВЕРНОЙ позицией
 
-local DribblePositionHistory = {} -- retained for CharacterAdded cleanup
+local DribblePositionHistory = {}
 
 local function ShouldDribbleNow(specificTarget, tacklerData)
     if not specificTarget or not tacklerData then return false end
     local currentTime = tick()
-    -- Антиспам
     if currentTime - AutoDribbleStatus.TackleDetectionCooldown < 0.2 then return false end
 
     local tacklerRoot = tacklerData.RootPart
     if not tacklerRoot then return false end
 
-    local myPos     = Vector3.new(HumanoidRootPart.Position.X, 0, HumanoidRootPart.Position.Z)
-    local tacklerPos = Vector3.new(tacklerRoot.Position.X, 0, tacklerRoot.Position.Z)
-    local toMe      = myPos - tacklerPos
-    local distFlat  = toMe.Magnitude
+    -- НОВОЕ: используем серверные позиции
+    local myServerPos = GetMyServerPosition()
+    local myPos = Vector3.new(myServerPos.X, 0, myServerPos.Z)
+
+    -- Серверная позиция врага
+    local ping = AutoTackleStatus.Ping
+    local tacklerVel = GetPositionBasedVelocity(specificTarget)
+    local flatVel = Vector3.new(tacklerVel.X, 0, tacklerVel.Z)
+    local tacklerServerPos = tacklerRoot.Position + flatVel * ping
+    local tacklerPos = Vector3.new(tacklerServerPos.X, 0, tacklerServerPos.Z)
+
+    local toMe = myPos - tacklerPos
+    local distFlat = toMe.Magnitude
 
     if distFlat < 0.1 or distFlat > AutoDribbleConfig.MaxDribbleDistance then return false end
 
-    -- AssemblyLinearVelocity — быстрая реакция (важнее точности для AutoDribble)
-    local tacklerVel   = tacklerData.Velocity
-    local flatVel      = Vector3.new(tacklerVel.X, 0, tacklerVel.Z)
     local tacklerSpeed = flatVel.Magnitude
 
-    -- Стоящий игрок не таклит в нас
     if tacklerSpeed < 3 then
         if Gui and AutoDribbleConfig.Enabled then
             Gui.AngleLabel.Text = string.format("v=%.1f (idle)", tacklerSpeed)
@@ -1046,19 +1057,21 @@ local function ShouldDribbleNow(specificTarget, tacklerData)
     end
 
     local tacklerDir = flatVel.Unit
-    local dirToMe    = toMe.Unit
-    local dot   = tacklerDir:Dot(dirToMe)
+    local dirToMe = toMe.Unit
+    local dot = tacklerDir:Dot(dirToMe)
     local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
 
     if Gui and AutoDribbleConfig.Enabled then
-        Gui.AngleLabel.Text = string.format("Angle: %.1f° v=%.1f", angle, tacklerSpeed)
+        Gui.AngleLabel.Text = string.format("Angle: %.1f° v=%.1f d=%.1f", angle, tacklerSpeed, distFlat)
     end
 
-    -- Враг летит не в нашу сторону — игнорируем
     if angle > AutoDribbleConfig.MinAngleForDribble then return false end
 
-    -- Время до столкновения
-    local relSpeed       = tacklerSpeed + math.max(HumanoidRootPart.AssemblyLinearVelocity.Magnitude, 1)
+    -- Время до столкновения с учётом ТВОЕЙ серверной скорости
+    local myVel = GetMyPositionBasedVelocity()
+    local myFlatVel = Vector3.new(myVel.X, 0, myVel.Z)
+    local mySpeed = myFlatVel.Magnitude
+    local relSpeed = tacklerSpeed + math.max(mySpeed, 1)
     local timeToCollision = distFlat / relSpeed
 
     if distFlat <= AutoDribbleConfig.DribbleActivationDistance then
@@ -1066,7 +1079,8 @@ local function ShouldDribbleNow(specificTarget, tacklerData)
         return true
     end
 
-    if timeToCollision < 0.55 then
+    -- Более агрессивная предикция: 0.45s вместо 0.55s
+    if timeToCollision < 0.45 then
         AutoDribbleStatus.TackleDetectionCooldown = currentTime
         return true
     end
@@ -1096,31 +1110,36 @@ AutoDribble.Start = function()
     AutoDribbleStatus.HeartbeatConnection = RunService.Heartbeat:Connect(function()
         if not AutoDribbleConfig.Enabled then return end
         pcall(function()
-            UpdatePing(); UpdateDribbleStates(); PrecomputePlayers(); UpdateTargetCircles()
+            UpdatePing(); UpdateDribbleStates(); RecordMyPosition(); PrecomputePlayers(); UpdateTargetCircles()
             IsTypingInChat = CheckIfTypingInChat()
         end)
     end)
 
     if not Gui then SetupGUI() end
 
-    -- Heartbeat приоритетнее RenderStepped для логики — меньше задержка реакции
     AutoDribbleStatus.Connection = RunService.Heartbeat:Connect(function()
         if not AutoDribbleConfig.Enabled then CleanupDebugText(); UpdateDebugVisibility(); return end
 
-        -- Быстрый путь без pcall-overhead: сначала проверяем нужные условия
         if not HasBall or not CanDribbleNow then
             if Gui then Gui.AutoDribbleLabel.Text = "AutoDribble: Idle" end
             return
         end
 
-        -- Ищем ближайшего активного таклера прямо из PrecomputedPlayers
-        -- (уже обновлено в HeartbeatConnection этого же кадра)
         local specificTarget, minDist, targetCount, nearestTacklerData = nil, math.huge, 0, nil
         for player, data in pairs(PrecomputedPlayers) do
             if data.IsValid and TackleStates[player] and TackleStates[player].IsTackling then
                 targetCount += 1
-                if data.Distance < minDist then
-                    minDist = data.Distance
+                
+                -- НОВОЕ: дистанция считается от серверной позиции
+                local myServerPos = GetMyServerPosition()
+                local ping = AutoTackleStatus.Ping
+                local tacklerVel = GetPositionBasedVelocity(player)
+                local flatVel = Vector3.new(tacklerVel.X, 0, tacklerVel.Z)
+                local tacklerServerPos = data.RootPart.Position + flatVel * ping
+                local serverDist = (Vector3.new(myServerPos.X, 0, myServerPos.Z) - Vector3.new(tacklerServerPos.X, 0, tacklerServerPos.Z)).Magnitude
+                
+                if serverDist < minDist then
+                    minDist = serverDist
                     specificTarget = player
                     nearestTacklerData = data
                 end
@@ -1128,7 +1147,7 @@ AutoDribble.Start = function()
         end
 
         if Gui then
-            Gui.DribbleTargetLabel.Text  = "Targets: " .. targetCount
+            Gui.DribbleTargetLabel.Text = "Targets: " .. targetCount
             Gui.DribbleTacklingLabel.Text = specificTarget
                 and string.format("Tackle: %.1f", minDist)
                 or "Tackle: None"
@@ -1139,7 +1158,6 @@ AutoDribble.Start = function()
             return
         end
 
-        -- Основная проверка
         if ShouldDribbleNow(specificTarget, nearestTacklerData) then
             PerformDribble()
         else
@@ -1305,7 +1323,7 @@ local function SetupUI(UI)
         UI.Sections.AutoDribble:Divider()
         UI.Sections.AutoDribble:Paragraph({
             Header = "Information",
-            Body = "Max Attack Angle: чем меньше — тем точнее (реагирует только когда враг идёт прямо на тебя)\nTackler Min Speed: минимальная скорость врага чтобы считать его активным таклером"
+            Body = "СЕРВЕРНАЯ ПРЕДИКЦИЯ: AutoDribble теперь учитывает где ТЫ находишься для сервера с учётом задержки\nMax Attack Angle: чем меньше — тем точнее (реагирует только когда враг идёт прямо на тебя)"
         })
     end
 
@@ -1333,16 +1351,16 @@ end
 local function SynchronizeConfigValues()
     if not uiElements then return end
     local pairs_sync = {
-        { uiElements.AutoTackleMaxDistance,       function(v) AutoTackleConfig.MaxDistance = v end },
-        { uiElements.AutoTackleTackleDistance,    function(v) AutoTackleConfig.TackleDistance = v end },
-        { uiElements.AutoTackleTackleSpeed,       function(v) AutoTackleConfig.TackleSpeed = v end },
-        { uiElements.AutoTackleDribbleDelay,      function(v) AutoTackleConfig.DribbleDelayTime = v end },
-        { uiElements.AutoTackleEagleEyeMinDelay,  function(v) AutoTackleConfig.EagleEyeMinDelay = v end },
-        { uiElements.AutoTackleEagleEyeMaxDelay,  function(v) AutoTackleConfig.EagleEyeMaxDelay = v end },
-        { uiElements.AutoTackleButtonScale,       function(v) AutoTackleConfig.ButtonScale = v end },
-        { uiElements.AutoDribbleMaxDistance,      function(v) AutoDribbleConfig.MaxDribbleDistance = v end },
+        { uiElements.AutoTackleMaxDistance, function(v) AutoTackleConfig.MaxDistance = v end },
+        { uiElements.AutoTackleTackleDistance, function(v) AutoTackleConfig.TackleDistance = v end },
+        { uiElements.AutoTackleTackleSpeed, function(v) AutoTackleConfig.TackleSpeed = v end },
+        { uiElements.AutoTackleDribbleDelay, function(v) AutoTackleConfig.DribbleDelayTime = v end },
+        { uiElements.AutoTackleEagleEyeMinDelay, function(v) AutoTackleConfig.EagleEyeMinDelay = v end },
+        { uiElements.AutoTackleEagleEyeMaxDelay, function(v) AutoTackleConfig.EagleEyeMaxDelay = v end },
+        { uiElements.AutoTackleButtonScale, function(v) AutoTackleConfig.ButtonScale = v end },
+        { uiElements.AutoDribbleMaxDistance, function(v) AutoDribbleConfig.MaxDribbleDistance = v end },
         { uiElements.AutoDribbleActivationDistance, function(v) AutoDribbleConfig.DribbleActivationDistance = v end },
-        { uiElements.AutoDribbleMinAngle,         function(v) AutoDribbleConfig.MinAngleForDribble = v end },
+        { uiElements.AutoDribbleMinAngle, function(v) AutoDribbleConfig.MinAngleForDribble = v end },
     }
     for _, pair in ipairs(pairs_sync) do
         local elem, setter = pair[1], pair[2]
@@ -1380,6 +1398,7 @@ function AutoDribbleTackleModule.Init(UI, coreParam, notifyFunc)
         AutoTackleStatus.TargetPositionHistory = {}
         AutoTackleStatus.TargetCircles = {}
         DribblePositionHistory = {}
+        MyPositionHistory = {} -- НОВОЕ
         CurrentTargetOwner = nil
         if AutoTackleConfig.Enabled and not AutoTackleStatus.Running then AutoTackle.Start() end
         if AutoDribbleConfig.Enabled and not AutoDribbleStatus.Running then AutoDribble.Start() end
