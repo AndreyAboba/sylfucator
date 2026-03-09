@@ -1,5 +1,5 @@
--- v3.2 IMPROVED AUTO DRIBBLE AUTO TACKLE
--- Улучшенная предикция + мгновенный AutoDribble на серверную позицию
+-- v3.3 IMPROVED AUTO DRIBBLE AUTO TACKLE
+-- Улучшенная предикция + мгновенный AutoDribble на серверную позицию + визуализация серверной позиции
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -71,6 +71,8 @@ local AutoDribbleConfig = {
     MaxDribbleDistance = 30,
     DribbleActivationDistance = 16,
     MinAngleForDribble = 30, -- угол атаки (враг должен двигаться на тебя)
+    PredictionMultiplier = 1.3, -- множитель для более ранней реакции
+    ShowServerPosition = true, -- визуализация серверной позиции
 }
 
 local DebugConfig = {
@@ -269,16 +271,18 @@ local function UpdatePredictionLabel(ownerRoot, player)
 end
 
 -- ========================================
--- СЕРВЕРНАЯ ПОЗИЦИЯ ИГРОКА
+-- СЕРВЕРНАЯ ПОЗИЦИЯ ИГРОКА (УЛУЧШЕННАЯ С CFRAME)
 -- ========================================
 -- История собственных позиций для вычисления своей серверной позиции
 local MyPositionHistory = {}
-local MY_HISTORY_SIZE = 8
+local MY_HISTORY_SIZE = 10 -- увеличили для более точного расчёта
 
 local function RecordMyPosition()
+    if not HumanoidRootPart then return end
+    
     table.insert(MyPositionHistory, {
         time = tick(),
-        pos = HumanoidRootPart.Position
+        cframe = HumanoidRootPart.CFrame -- используем CFrame вместо Position
     })
     
     while #MyPositionHistory > MY_HISTORY_SIZE do
@@ -299,11 +303,16 @@ local function GetMyVelocity()
         return Vector3.zero
     end
     
-    return (newest.pos - oldest.pos) / dt
+    -- Используем позицию из CFrame
+    return (newest.cframe.Position - oldest.cframe.Position) / dt
 end
 
 -- Вычисление серверной позиции игрока (где я нахожусь для сервера)
 local function GetMyServerPosition()
+    if not HumanoidRootPart then
+        return Vector3.zero
+    end
+    
     local ping = AutoTackleStatus.Ping
     local myVel = GetMyVelocity()
     local flatVel = Vector3.new(myVel.X, 0, myVel.Z)
@@ -311,6 +320,111 @@ local function GetMyServerPosition()
     -- Серверная позиция = текущая - (скорость × пинг)
     -- Потому что сервер видит нас там, где мы были пинг назад
     return HumanoidRootPart.Position - (flatVel * ping)
+end
+
+-- Вычисление серверного CFrame игрока
+local function GetMyServerCFrame()
+    if not HumanoidRootPart then
+        return CFrame.new()
+    end
+    
+    local serverPos = GetMyServerPosition()
+    
+    -- Сохраняем ротацию текущего CFrame
+    return CFrame.new(serverPos) * (HumanoidRootPart.CFrame - HumanoidRootPart.CFrame.Position)
+end
+
+-- ========================================
+-- ВИЗУАЛИЗАЦИЯ СЕРВЕРНОЙ ПОЗИЦИИ (3D BOX)
+-- ========================================
+local ServerPositionBox = {
+    Lines = {},
+    Enabled = false
+}
+
+local function CreateServerPositionBox()
+    -- Создаём 12 линий для 3D бокса (куб имеет 12 рёбер)
+    for i = 1, 12 do
+        local line = Drawing.new("Line")
+        line.Thickness = 2
+        line.Color = Color3.fromRGB(0, 255, 255) -- Cyan цвет
+        line.Transparency = 0.7
+        line.Visible = false
+        table.insert(ServerPositionBox.Lines, line)
+    end
+    ServerPositionBox.Enabled = true
+end
+
+local function UpdateServerPositionBox()
+    if not ServerPositionBox.Enabled or not AutoDribbleConfig.ShowServerPosition or not AutoDribbleConfig.Enabled then
+        for _, line in ipairs(ServerPositionBox.Lines) do
+            line.Visible = false
+        end
+        return
+    end
+    
+    if not HumanoidRootPart or not Humanoid then
+        for _, line in ipairs(ServerPositionBox.Lines) do
+            line.Visible = false
+        end
+        return
+    end
+    
+    local serverCFrame = GetMyServerCFrame()
+    
+    -- Размеры бокса на основе размеров персонажа
+    local humanoidSize = Vector3.new(2, Humanoid.HipHeight + 0.5, 1) -- ширина, высота, глубина
+    local halfSize = humanoidSize / 2
+    
+    -- 8 углов куба в локальном пространстве
+    local corners = {
+        Vector3.new(-halfSize.X, -halfSize.Y, -halfSize.Z),
+        Vector3.new(halfSize.X, -halfSize.Y, -halfSize.Z),
+        Vector3.new(halfSize.X, -halfSize.Y, halfSize.Z),
+        Vector3.new(-halfSize.X, -halfSize.Y, halfSize.Z),
+        Vector3.new(-halfSize.X, halfSize.Y, -halfSize.Z),
+        Vector3.new(halfSize.X, halfSize.Y, -halfSize.Z),
+        Vector3.new(halfSize.X, halfSize.Y, halfSize.Z),
+        Vector3.new(-halfSize.X, halfSize.Y, halfSize.Z),
+    }
+    
+    -- Преобразуем углы в мировое пространство
+    local worldCorners = {}
+    for _, corner in ipairs(corners) do
+        table.insert(worldCorners, serverCFrame * corner)
+    end
+    
+    -- 12 рёбер куба (пары индексов углов)
+    local edges = {
+        {1, 2}, {2, 3}, {3, 4}, {4, 1}, -- нижняя грань
+        {5, 6}, {6, 7}, {7, 8}, {8, 5}, -- верхняя грань
+        {1, 5}, {2, 6}, {3, 7}, {4, 8}  -- вертикальные рёбра
+    }
+    
+    -- Рисуем рёбра
+    for i, edge in ipairs(edges) do
+        local startPoint = worldCorners[edge[1]]
+        local endPoint = worldCorners[edge[2]]
+        
+        local startScreen, startVisible = Camera:WorldToViewportPoint(startPoint)
+        local endScreen, endVisible = Camera:WorldToViewportPoint(endPoint)
+        
+        local line = ServerPositionBox.Lines[i]
+        
+        if startVisible and endVisible and startScreen.Z > 0.1 and endScreen.Z > 0.1 then
+            line.From = Vector2.new(startScreen.X, startScreen.Y)
+            line.To = Vector2.new(endScreen.X, endScreen.Y)
+            line.Visible = true
+        else
+            line.Visible = false
+        end
+    end
+end
+
+local function HideServerPositionBox()
+    for _, line in ipairs(ServerPositionBox.Lines) do
+        line.Visible = false
+    end
 end
 
 -- ========================================
@@ -347,6 +461,7 @@ local function SetupGUI()
         PingLabel = Drawing.new("Text"),
         AngleLabel = Drawing.new("Text"),
         PredictionLabel = Drawing.new("Text"),
+        ServerPosLabel = Drawing.new("Text"), -- новый label
         TargetRingLines = {},
         TackleDebugLabels = {},
         DribbleDebugLabels = {}
@@ -398,7 +513,8 @@ local function SetupGUI()
         Gui.DribbleStatusLabel,
         Gui.DribbleTargetLabel,
         Gui.DribbleTacklingLabel,
-        Gui.AutoDribbleLabel
+        Gui.AutoDribbleLabel,
+        Gui.ServerPosLabel -- добавляем новый label
     }
     
     for _, label in ipairs(dribbleLabels) do
@@ -410,10 +526,13 @@ local function SetupGUI()
         table.insert(Gui.DribbleDebugLabels, label)
     end
     
+    Gui.ServerPosLabel.Color = Color3.fromRGB(0, 255, 255) -- Cyan для серверной позиции
+    
     Gui.DribbleStatusLabel.Position = Vector2.new(centerX, offsetDribbleY); offsetDribbleY = offsetDribbleY + 15
     Gui.DribbleTargetLabel.Position = Vector2.new(centerX, offsetDribbleY); offsetDribbleY = offsetDribbleY + 15
     Gui.DribbleTacklingLabel.Position = Vector2.new(centerX, offsetDribbleY); offsetDribbleY = offsetDribbleY + 15
-    Gui.AutoDribbleLabel.Position = Vector2.new(centerX, offsetDribbleY)
+    Gui.AutoDribbleLabel.Position = Vector2.new(centerX, offsetDribbleY); offsetDribbleY = offsetDribbleY + 15
+    Gui.ServerPosLabel.Position = Vector2.new(centerX, offsetDribbleY)
     
     Gui.TackleWaitLabel.Text = "Wait: 0.00"
     Gui.TackleTargetLabel.Text = "Target: None"
@@ -430,6 +549,7 @@ local function SetupGUI()
     Gui.DribbleTargetLabel.Text = "Targets: 0"
     Gui.DribbleTacklingLabel.Text = "Nearest: None"
     Gui.AutoDribbleLabel.Text = "AutoDribble: Idle"
+    Gui.ServerPosLabel.Text = "ServerPos: OFF"
     
     for i = 1, 24 do
         local line = Drawing.new("Line")
@@ -438,6 +558,9 @@ local function SetupGUI()
         line.Visible = false
         table.insert(Gui.TargetRingLines, line)
     end
+    
+    -- Создаём бокс для серверной позиции
+    CreateServerPositionBox()
 end
 
 local function UpdateDebugVisibility()
@@ -457,6 +580,10 @@ local function UpdateDebugVisibility()
         for _, line in ipairs(Gui.TargetRingLines) do
             line.Visible = false
         end
+    end
+    
+    if not AutoDribbleConfig.Enabled or not AutoDribbleConfig.ShowServerPosition then
+        HideServerPositionBox()
     end
     
     if AutoTackleStatus.ButtonGui and AutoTackleStatus.ButtonGui:FindFirstChild("ManualTackleButton") then
@@ -484,6 +611,7 @@ local function CleanupDebugText()
         Gui.DribbleTargetLabel.Text = "Targets: 0"
         Gui.DribbleTacklingLabel.Text = "Nearest: None"
         Gui.AutoDribbleLabel.Text = "AutoDribble: Idle"
+        Gui.ServerPosLabel.Text = "ServerPos: OFF"
     end
 end
 
@@ -532,6 +660,70 @@ local function Hide3DCircle(circle)
     if not circle then return end
     for _, line in ipairs(circle) do
         line.Visible = false
+    end
+end
+
+local function DrawServerPositionBox()
+    if not Gui or not Gui.ServerPositionBox or not DebugConfig.Enabled then
+        return
+    end
+    
+    if not AutoDribbleConfig.Enabled and not AutoTackleConfig.Enabled then
+        for _, line in ipairs(Gui.ServerPositionBox) do
+            line.Visible = false
+        end
+        return
+    end
+    
+    local serverCFrame = GetMyServerCFrame()
+    local humanoidHeight = Humanoid and Humanoid.HipHeight or 2
+    local torsoHeight = 2
+    local totalHeight = humanoidHeight + torsoHeight
+    
+    -- Размеры бокса (пропорции игрока)
+    local width = 2
+    local depth = 1
+    local height = totalHeight
+    
+    -- 8 вершин бокса относительно серверной позиции
+    local halfW = width / 2
+    local halfD = depth / 2
+    
+    local corners = {
+        serverCFrame * CFrame.new(-halfW, 0, -halfD),
+        serverCFrame * CFrame.new(halfW, 0, -halfD),
+        serverCFrame * CFrame.new(halfW, 0, halfD),
+        serverCFrame * CFrame.new(-halfW, 0, halfD),
+        serverCFrame * CFrame.new(-halfW, height, -halfD),
+        serverCFrame * CFrame.new(halfW, height, -halfD),
+        serverCFrame * CFrame.new(halfW, height, halfD),
+        serverCFrame * CFrame.new(-halfW, height, halfD)
+    }
+    
+    -- Индексы линий бокса (12 рёбер)
+    local edges = {
+        {1, 2}, {2, 3}, {3, 4}, {4, 1}, -- нижний квадрат
+        {5, 6}, {6, 7}, {7, 8}, {8, 5}, -- верхний квадрат
+        {1, 5}, {2, 6}, {3, 7}, {4, 8}  -- вертикальные рёбра
+    }
+    
+    for i, edge in ipairs(edges) do
+        local line = Gui.ServerPositionBox[i]
+        if not line then break end
+        
+        local p1 = corners[edge[1]].Position
+        local p2 = corners[edge[2]].Position
+        
+        local s1, on1 = Camera:WorldToViewportPoint(p1)
+        local s2, on2 = Camera:WorldToViewportPoint(p2)
+        
+        if on1 and on2 and s1.Z > 0.1 and s2.Z > 0.1 then
+            line.From = Vector2.new(s1.X, s1.Y)
+            line.To = Vector2.new(s2.X, s2.Y)
+            line.Visible = true
+        else
+            line.Visible = false
+        end
     end
 end
 
@@ -1084,6 +1276,7 @@ AutoTackle.Start = function()
         pcall(UpdateDribbleStates)
         pcall(PrecomputePlayers)
         pcall(UpdateTargetCircles)
+        pcall(DrawServerPositionBox)
         IsTypingInChat = CheckIfTypingInChat()
     end)
     
@@ -1296,6 +1489,13 @@ AutoTackle.Stop = function()
     end
     AutoTackleStatus.TargetCircles = {}
     
+    if Gui and Gui.ServerPositionBox then
+        for _, line in ipairs(Gui.ServerPositionBox) do
+            line:Remove()
+        end
+        Gui.ServerPositionBox = {}
+    end
+    
     if AutoTackleStatus.ButtonGui then
         AutoTackleStatus.ButtonGui:Destroy()
         AutoTackleStatus.ButtonGui = nil
@@ -1310,7 +1510,7 @@ end
 -- УЛУЧШЕННЫЙ AUTODRIBBLE MODULE
 -- ========================================
 
--- Мгновенная реакция: проверяем должен ли враг идти к нашей СЕРВЕРНОЙ позиции
+-- БОЛЕЕ РАННЯЯ РЕАКЦИЯ: враг идёт к серверной позиции с множителем предикции
 local function ShouldDribbleNow(specificTarget, tacklerData)
     if not specificTarget or not tacklerData then
         return false
@@ -1318,8 +1518,8 @@ local function ShouldDribbleNow(specificTarget, tacklerData)
     
     local currentTime = tick()
     
-    -- Убираем cooldown для мгновенной реакции (было 0.2)
-    if currentTime - AutoDribbleStatus.TackleDetectionCooldown < 0.05 then
+    -- Убираем cooldown для мгновенной реакции
+    if currentTime - AutoDribbleStatus.TackleDetectionCooldown < 0.03 then
         return false
     end
     
@@ -1372,12 +1572,14 @@ local function ShouldDribbleNow(specificTarget, tacklerData)
         return true
     end
     
-    -- Время до столкновения (убрали задержку 0.55 - теперь мгновенно)
+    -- БОЛЕЕ РАННЯЯ реакция: используем множитель предикции
     local relSpeed = tacklerSpeed + math.max(HumanoidRootPart.AssemblyLinearVelocity.Magnitude, 1)
     local timeToCollision = distFlat / relSpeed
     
-    -- Мгновенная реакция без ожидания
-    if timeToCollision < 0.4 then
+    -- Срабатываем раньше с помощью множителя (1.3 = на 30% раньше)
+    local predictedTime = timeToCollision * AutoDribbleConfig.PredictionMultiplier
+    
+    if predictedTime < 0.5 then
         AutoDribbleStatus.TackleDetectionCooldown = currentTime
         return true
     end
@@ -1387,7 +1589,7 @@ end
 
 local function PerformDribble()
     local currentTime = tick()
-    if currentTime - AutoDribbleStatus.LastDribbleTime < 0.05 then
+    if currentTime - AutoDribbleStatus.LastDribbleTime < 0.03 then
         return
     end
     
@@ -1423,6 +1625,7 @@ AutoDribble.Start = function()
             UpdateDribbleStates()
             PrecomputePlayers()
             UpdateTargetCircles()
+            DrawServerPositionBox()
             IsTypingInChat = CheckIfTypingInChat()
             RecordMyPosition() -- Записываем свою позицию для расчёта серверной позиции
         end)
@@ -1431,6 +1634,25 @@ AutoDribble.Start = function()
     if not Gui then
         SetupGUI()
     end
+    
+    -- Отдельный цикл для визуализации серверной позиции
+    AutoDribbleStatus.VisualizationConnection = RunService.RenderStepped:Connect(function()
+        if AutoDribbleConfig.Enabled and AutoDribbleConfig.ShowServerPosition then
+            UpdateServerPositionBox()
+            
+            if Gui then
+                local serverPos = GetMyServerPosition()
+                local clientPos = HumanoidRootPart.Position
+                local offset = (clientPos - serverPos).Magnitude
+                Gui.ServerPosLabel.Text = string.format("ServerPos: %.1f studs", offset)
+            end
+        else
+            HideServerPositionBox()
+            if Gui then
+                Gui.ServerPosLabel.Text = "ServerPos: OFF"
+            end
+        end
+    end)
     
     AutoDribbleStatus.Connection = RunService.Heartbeat:Connect(function()
         if not AutoDribbleConfig.Enabled then
@@ -1452,8 +1674,13 @@ AutoDribble.Start = function()
             if data.IsValid and TackleStates[player] and TackleStates[player].IsTackling then
                 targetCount = targetCount + 1
                 
-                if data.Distance < minDist then
-                    minDist = data.Distance
+                -- Расстояние до СЕРВЕРНОЙ позиции игрока
+                local myServerPos = GetMyServerPosition()
+                local serverDistance = (Vector3.new(data.RootPart.Position.X, 0, data.RootPart.Position.Z) - 
+                                       Vector3.new(myServerPos.X, 0, myServerPos.Z)).Magnitude
+                
+                if serverDistance < minDist then
+                    minDist = serverDistance
                     specificTarget = player
                     nearestTacklerData = data
                 end
@@ -1500,9 +1727,15 @@ AutoDribble.Stop = function()
         AutoDribbleStatus.HeartbeatConnection = nil
     end
     
+    if AutoDribbleStatus.VisualizationConnection then
+        AutoDribbleStatus.VisualizationConnection:Disconnect()
+        AutoDribbleStatus.VisualizationConnection = nil
+    end
+    
     AutoDribbleStatus.Running = false
     CleanupDebugText()
     UpdateDebugVisibility()
+    HideServerPositionBox()
     
     if notify then
         notify("AutoDribble", "Stopped", true)
@@ -1727,10 +1960,34 @@ local function SetupUI(UI)
             end
         }, "AutoDribbleMinAngle")
         
+        uiElements.AutoDribblePredictionMultiplier = UI.Sections.AutoDribble:Slider({
+            Name = "Prediction Multiplier",
+            Minimum = 1.0,
+            Maximum = 2.0,
+            Default = AutoDribbleConfig.PredictionMultiplier,
+            Precision = 1,
+            Callback = function(v)
+                AutoDribbleConfig.PredictionMultiplier = v
+            end
+        }, "AutoDribblePredictionMultiplier")
+        
+        UI.Sections.AutoDribble:Divider()
+        
+        uiElements.AutoDribbleShowServerPosition = UI.Sections.AutoDribble:Toggle({
+            Name = "Show Server Position",
+            Default = AutoDribbleConfig.ShowServerPosition,
+            Callback = function(v)
+                AutoDribbleConfig.ShowServerPosition = v
+                if not v then
+                    HideServerPositionBox()
+                end
+            end
+        }, "AutoDribbleShowServerPosition")
+        
         UI.Sections.AutoDribble:Divider()
         UI.Sections.AutoDribble:Paragraph({
             Header = "Information",
-            Body = "Max Attack Angle: Угол атаки врага (меньше = точнее)\nДриббл на СЕРВЕРНУЮ позицию с учётом пинга"
+            Body = "Prediction Multiplier: Чем выше - тем раньше сработает дриббл\n1.0 = нормально, 1.5 = на 50% раньше, 2.0 = в 2 раза раньше\nCyan бокс = твоя позиция для сервера"
         })
     end
     
@@ -1775,6 +2032,7 @@ local function SynchronizeConfigValues()
         {uiElements.AutoDribbleMaxDistance, function(v) AutoDribbleConfig.MaxDribbleDistance = v end},
         {uiElements.AutoDribbleActivationDistance, function(v) AutoDribbleConfig.DribbleActivationDistance = v end},
         {uiElements.AutoDribbleMinAngle, function(v) AutoDribbleConfig.MinAngleForDribble = v end},
+        {uiElements.AutoDribblePredictionMultiplier, function(v) AutoDribbleConfig.PredictionMultiplier = v end},
     }
     
     for _, pair in ipairs(pairssync) do
@@ -1840,6 +2098,7 @@ end
 function AutoDribbleTackleModule:Destroy()
     AutoTackle.Stop()
     AutoDribble.Stop()
+    HideServerPositionBox()
 end
 
 return AutoDribbleTackleModule
