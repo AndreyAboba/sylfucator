@@ -1,5 +1,6 @@
 -- [v36.0] AUTO SHOOT + AUTO PICKUP — Smart GK-aware, zero manual config
 local Players = game:GetService("Players")
+print('2')
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -594,7 +595,7 @@ local function CalcLaunchDir(startPos, targetPos)
     local baseComp = (0.5 * GRAVITY + 0.19 * k * V) * t * t * gravRamp
     local t2       = t * t
     local s        = t2 / (t2 + 0.80 * 0.80)
-    local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.51 * s * s * s
+    local farScale = 0.80 + 0.16 * s + 0.58 * s * s + 0.46 * s * s * s
     local upDy     = math.max(targetPos.Y - startPos.Y, 0)
     local nearRise = upDy * 0.68 * math.exp(-(t / 0.34) ^ 2)
     local corrY    = targetPos.Y + baseComp * farScale - nearRise
@@ -713,7 +714,7 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
             -- На ближних и средних сильнее штрафуем слишком верхние цели
             score = score - hFrac * hFrac * math.clamp((85 - dist) / 40, 0, 1) * 3.8
             -- В зоне 100-150 без спина высокие точки часто приходят выше нужного → мягко прижимаем выбор вниз
-            local midNoSpinHighPenalty = hFrac * math.clamp((dist - 100) / 50, 0, 1) * math.clamp((155 - dist) / 55, 0, 1) * 2.4
+            local midNoSpinHighPenalty = hFrac * math.clamp((dist - 95) / 45, 0, 1) * math.clamp((160 - dist) / 60, 0, 1) * 3.2
             if isLobShot and dist > 95 then score = score + 4.0 end
 
             -- Навес: ценен когда GK низко или выходит вперёд
@@ -862,10 +863,11 @@ local function GetTarget(dist, gkX, gkY, isAggressive, gkHrp, gkVel, gkIsNPC, gk
                 local spinDrop = 0.18 + 0.34 * hFrac
                 shootLocalY = math.max(Y_BOT_INSET, localY - spinDrop)
             else
-                local midBand = math.clamp((dist - 100) / 45, 0, 1) * math.clamp((155 - dist) / 55, 0, 1)
+                local midBand = math.clamp((dist - 95) / 40, 0, 1) * math.clamp((160 - dist) / 60, 0, 1)
                 local npcBand = gkIsNPC and 1 or 0
-                local noSpinDrop = (0.09 + 0.16 * hFrac) * midBand * (1.0 + 0.35 * npcBand)
-                shootLocalY = math.max(Y_BOT_INSET, localY - noSpinDrop)
+                local noSpinDrop = (0.18 + 0.28 * hFrac) * midBand * (1.0 + 0.45 * npcBand)
+                local extraFlatDrop = (0.05 + 0.07 * math.clamp(1 - hFrac, 0, 1)) * midBand
+                shootLocalY = math.max(Y_BOT_INSET, localY - noSpinDrop - extraFlatDrop)
             end
 
             -- Глубина ворот: для спина увеличиваем умеренно, чтобы сервер принял эффект,
