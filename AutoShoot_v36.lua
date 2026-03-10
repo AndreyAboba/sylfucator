@@ -1476,7 +1476,7 @@ end
 
 local function SetupUI(UI)
     if UI.Sections.AutoShoot then
-        UI.Sections.AutoShoot:Header({ Name = "AutoShoot v36" })
+        UI.Sections.AutoShoot:Header({ Name = "AutoShoot" })
         UI.Sections.AutoShoot:Divider()
 
         uiElements.AutoShootEnabled = UI.Sections.AutoShoot:Toggle({
@@ -1531,14 +1531,14 @@ local function SetupUI(UI)
             Default = AutoShootBallSpeed, Precision = 1,
             Callback = function(v) AutoShootBallSpeed = v end
         }, "AutoShootBallSpeed")
-        UI.Sections.AutoShoot:SubLabel({Text = "~400 studs/s. Мяч выше цели → увеличь | Мяч ниже → уменьши"})
+        UI.Sections.AutoShoot:SubLabel({Text = "~400 studs/s. if ball higher → increase | ball down → reduce"})
 
         uiElements.AutoShootDragComp = UI.Sections.AutoShoot:Slider({
-            Name = "Drag Compensation", Minimum = 0, Maximum = 1.0,
+            Name = "Drag Compensation", Minimum = 0, Maximum = 3,
             Default = AutoShootDragComp, Precision = 2,
             Callback = function(v) AutoShootDragComp = v end
         }, "AutoShootDragComp")
-        UI.Sections.AutoShoot:SubLabel({Text = "[↑] Мяч не долетает → увеличь  |  Перелёт → уменьши"})
+        UI.Sections.AutoShoot:SubLabel({Text = "[↑] ball does not reach → increase  | flight away → reduce"})
 
         uiElements.AutoShootDerivMult = UI.Sections.AutoShoot:Slider({
             Name = "Derivation Mult", Minimum = 0.5, Maximum = 10.0,
