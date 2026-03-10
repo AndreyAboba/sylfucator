@@ -44,11 +44,11 @@ local AutoTackleConfig = {
     Mode = "OnlyDribble",
     MaxDistance = 20,
     TackleDistance = 0,
-    TackleSpeed = 47,
+    TackleSpeed = 60,
     OnlyPlayer = true,
     RotationMethod = "Snap",
-    DribbleDelayTime = 0.63,
-    EagleEyeMinDelay = 0.1,
+    DribbleDelayTime = 0,
+    EagleEyeMinDelay = 0.2,
     EagleEyeMaxDelay = 0.6,
     ManualTackleEnabled = true,
     ManualTackleKeybind = Enum.KeyCode.Q,
@@ -60,16 +60,16 @@ local AutoTackleConfig = {
 local AutoDribbleConfig = {
     Enabled = false,
     MaxDribbleDistance = 30,
-    DribbleActivationDistance = 16,
+    DribbleActivationDistance = 17,
     -- MinAngleForDribble: угол при котором враг считается "летящим на нас"
     -- 90 = реагируем на любого кто хоть как-то движется в нашу сторону
     -- 30 = только если летит почти прямо на нас
-    MinAngleForDribble = 75,
-    ShowServerPos = true,
+    MinAngleForDribble = 32,
+    ShowServerPos = false,
 }
 
 local DebugConfig = {
-    Enabled = true,
+    Enabled = false,
     MoveEnabled = false,
     Position = Vector2.new(0.5, 0.5)
 }
@@ -1349,11 +1349,6 @@ local function SetupUI(UI)
             Default = AutoTackleConfig.ButtonScale, Precision = 2,
             Callback = SetTackleButtonScale
         }, "AutoTackleButtonScale")
-        UI.Sections.AutoTackle:Divider()
-        UI.Sections.AutoTackle:Paragraph({
-            Header = "Information",
-            Body = "OnlyDribble: Ждёт дриббл врага → DribbleDelay → такл\nEagleEye: Рандомный таймер; сброс при дрибе → DribbleDelay → такл\nManualTackle: Только по нажатию\nPowerShooting: Мгновенный такл если враг шутит"
-        })
     end
 
     if UI.Sections.AutoDribble then
@@ -1397,10 +1392,6 @@ local function SetupUI(UI)
             end
         }, "AutoDribbleShowServerPos")
         UI.Sections.AutoDribble:Divider()
-        UI.Sections.AutoDribble:Paragraph({
-            Header = "Information",
-            Body = "v3.4: 3-стадийная детекция\n[0] Point Blank < 4 studs → мгновенный дек\n[1] Activation Zone → дек без проверок\n[2] Mid Range → угол (dot) + время столкновения\nCosThreshold кэшируется, acos только для GUI"
-        })
     end
 
     if UI.Sections.Debug then
@@ -1408,7 +1399,7 @@ local function SetupUI(UI)
         UI.Sections.Debug:SubLabel({ Text = "* Only for AutoDribble/AutoTackle" })
         UI.Sections.Debug:Divider()
         uiElements.DebugEnabled = UI.Sections.Debug:Toggle({
-            Name = "Debug Text Enabled", Default = DebugConfig.Enabled,
+            Name = "Debug Text", Default = DebugConfig.Enabled,
             Callback = function(v) DebugConfig.Enabled = v; UpdateDebugVisibility() end
         }, "DebugEnabled")
         uiElements.DebugMoveEnabled = UI.Sections.Debug:Toggle({
