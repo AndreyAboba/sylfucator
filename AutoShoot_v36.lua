@@ -1569,46 +1569,46 @@ local function SetupUI(UI)
         uiElements.AutoShootDebugText = UI.Sections.AutoShoot:Toggle({
             Name = "Debug Text", Default = AutoShootDebugText,
             Callback = function(v) AutoShoot.SetDebugText(v) end
-        }, "AutoShootDebugText")
+        }, "ADebugText")
 
         UI.Sections.AutoShoot:Divider()
         uiElements.ShowTrajectory = UI.Sections.AutoShoot:Toggle({
             Name = "Show Trajectory", Default = ShowTrajectory,
             Callback = function(v) ShowTrajectory = v end
-        }, "ShowTrajectory")
+        }, "ShowTrajectory123")
         uiElements.Show3DBoxes = UI.Sections.AutoShoot:Toggle({
             Name = "Show 3D Boxes", Default = Show3DBoxes,
             Callback = function(v) Show3DBoxes = v end
-        }, "Show3DBoxes")
+        }, "Showbox12")
         uiElements.VisualsOnlyWithBall = UI.Sections.AutoShoot:Toggle({
             Name = "Visuals Only With Ball", Default = VisualsOnlyWithBall,
             Callback = function(v) VisualsOnlyWithBall = v end
-        }, "VisualsOnlyWithBall")
+        }, "VOnlyWithall")
 
         uiElements.TrajectoryColor = UI.Sections.AutoShoot:Colorpicker({
             Name = "Trajectory Color", Default = TrajectoryColor,
             Callback = function(v) TrajectoryColor = v; ApplyVisualStyles() end
-        }, "TrajectoryColor")
+        }, "TreoryColoj")
         uiElements.StartCircleColor = UI.Sections.AutoShoot:Colorpicker({
             Name = "Start Circle Color", Default = StartCircleColor,
             Callback = function(v) StartCircleColor = v; ApplyVisualStyles() end
-        }, "StartCircleColor")
+        }, "StCibcleColor")
         uiElements.TargetCubeColor = UI.Sections.AutoShoot:Colorpicker({
             Name = "Aim Box Color", Default = TargetCubeColor,
             Callback = function(v) TargetCubeColor = v; ApplyVisualStyles() end
-        }, "TargetCubeColor")
+        }, "TargetCkbeCr")
         uiElements.GoalCubeColor = UI.Sections.AutoShoot:Colorpicker({
             Name = "Predicted Box Color", Default = GoalCubeColor,
             Callback = function(v) GoalCubeColor = v; ApplyVisualStyles() end
-        }, "GoalCubeColor")
+        }, "GoabeCoor")
         uiElements.NoSpinCubeColor = UI.Sections.AutoShoot:Colorpicker({
             Name = "Goal Frame Color", Default = NoSpinCubeColor,
             Callback = function(v) NoSpinCubeColor = v; ApplyVisualStyles() end
-        }, "NoSpinCubeColor")
+        }, "NoSinCubeCor")
         uiElements.PeakCubeColor = UI.Sections.AutoShoot:Colorpicker({
             Name = "Peak Box Color", Default = PeakCubeColor,
             Callback = function(v) PeakCubeColor = v; ApplyVisualStyles() end
-        }, "PeakCubeColor")
+        }, "PeaCubClor")
     end
 
     if UI.Sections.AutoPickup then
