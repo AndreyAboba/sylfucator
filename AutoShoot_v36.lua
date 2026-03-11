@@ -1313,7 +1313,21 @@ local function ToggleManualButton(v)
 end
 local function SetButtonScale(v)
     AutoShootButtonScale = v
-    if AutoShootManualButton then SetupManualButton() end
+    if AutoShootManualButton and AutoShootStatus.ButtonGui then
+        local frame = AutoShootStatus.ButtonGui:FindFirstChildOfClass("Frame")
+        if frame then
+            local size = 50 * AutoShootButtonScale
+            frame.Size = UDim2.new(0, size, 0, size)
+            local icon = frame:FindFirstChildOfClass("ImageLabel")
+            if icon then
+                icon.Size     = UDim2.new(0, size * 0.6, 0, size * 0.6)
+                icon.Position = UDim2.new(0.5, -size * 0.3, 0.5, -size * 0.3)
+            end
+            -- позицию НЕ трогаем, чтобы не сбрасывать место кнопки
+        end
+    elseif AutoShootManualButton then
+        SetupManualButton()
+    end
 end
 
 -- ============================================================
@@ -1465,14 +1479,14 @@ local uiElements = {}
 local function SynchronizeConfigValues()
     if not uiElements then return end
     local pairs_sync = {
-        { uiElements.AutoShootMaxDist,              function(v) AutoShootMaxDistance = v end },
-        { uiElements.AutoShootCurveDistanceLimit,   function(v) AutoShootCurveDistanceLimit = v end },
-        { uiElements.AutoShootBallSpeed,            function(v) AutoShootBallSpeed = v end },
-        { uiElements.AutoShootDragComp,             function(v) AutoShootDragComp = v end },
-        { uiElements.AutoShootDerivMult,            function(v) AutoShootDerivMult = v end },
-        { uiElements.AutoShootButtonScale,          function(v) SetButtonScale(v) end },
-        { uiElements.AutoPickupDist,                function(v) AutoPickupDist = v end },
-        { uiElements.AutoPickupSpoof,               function(v) AutoPickupSpoofValue = v end },
+        { uiElements.AutoShootMaxDist,            function(v) AutoShootMaxDistance = v end },
+        { uiElements.AutoShootCurveDistanceLimit, function(v) AutoShootCurveDistanceLimit = v end },
+        { uiElements.AutoShootBallSpeed,          function(v) AutoShootBallSpeed = v end },
+        { uiElements.AutoShootDragComp,           function(v) AutoShootDragComp = v end },
+        { uiElements.AutoShootDerivMult,          function(v) AutoShootDerivMult = v end },
+        { uiElements.AutoShootButtonScale,        function(v) SetButtonScale(v) end },
+        { uiElements.AutoPickupDist,              function(v) AutoPickupDist = v end },
+        { uiElements.AutoPickupSpoof,             function(v) AutoPickupSpoofValue = v end },
     }
     for _, pair in ipairs(pairs_sync) do
         local elem, setter = pair[1], pair[2]
@@ -1480,8 +1494,15 @@ local function SynchronizeConfigValues()
     end
 end
 
-
 local function SetupUI(UI)
+    -- ═══════════════════════════════════════════════════════════
+    -- ВАЖНО: Colorpicker'ы регистрируются ПОСЛЕДНИМИ (после всех
+    -- Toggle/Slider/Dropdown/Keybind) — иначе скрытый Toggle
+    -- внутри каждого Colorpicker сдвигает bool-индекс библиотеки
+    -- и все Toggle ПОСЛЕ colorpicker'ов читают неверные значения
+    -- из конфига при загрузке.
+    -- ═══════════════════════════════════════════════════════════
+
     if UI.Sections.AutoShoot then
         UI.Sections.AutoShoot:Header({ Name = "AutoShoot" })
         UI.Sections.AutoShoot:Divider()
@@ -1489,35 +1510,35 @@ local function SetupUI(UI)
         uiElements.AutoShootEnabled = UI.Sections.AutoShoot:Toggle({
             Name = "Enabled", Default = AutoShootEnabled,
             Callback = function(v) AutoShootEnabled = v; if v then AutoShoot.Start() else AutoShoot.Stop() end end
-        }, "ShootEnabled")
+        }, "AutoShootEnabled")
 
         uiElements.AutoShootLegit = UI.Sections.AutoShoot:Toggle({
             Name = "Legit Animation", Default = AutoShootLegit,
             Callback = function(v) AutoShootLegit = v end
-        }, "ShootLegit")
+        }, "AutoShootLegit")
 
         UI.Sections.AutoShoot:Divider()
 
         uiElements.AutoShootManual = UI.Sections.AutoShoot:Toggle({
             Name = "Manual Shot", Default = AutoShootManualShot,
             Callback = function(v) AutoShootManualShot = v; UpdateModeText() end
-        }, "ShootManual")
+        }, "AutoShootManual")
 
         uiElements.AutoShootKey = UI.Sections.AutoShoot:Keybind({
             Name = "Shoot Key", Default = AutoShootShootKey,
             Callback = function(v) AutoShootShootKey = v; UpdateModeText() end
-        }, "ShootKey")
+        }, "AutoShootKey")
 
         uiElements.AutoShootManualButton = UI.Sections.AutoShoot:Toggle({
             Name = "Manual Button", Default = AutoShootManualButton,
             Callback = function(v) ToggleManualButton(v) end
-        }, "AManualButton")
+        }, "AutoShootManualButton")
 
         uiElements.AutoShootButtonScale = UI.Sections.AutoShoot:Slider({
             Name = "Button Scale", Minimum = 0.5, Maximum = 2.0,
             Default = AutoShootButtonScale, Precision = 2,
             Callback = function(v) SetButtonScale(v) end
-        }, "ButtonScale")
+        }, "AutoShootButtonScale")
 
         UI.Sections.AutoShoot:Divider()
 
@@ -1525,7 +1546,7 @@ local function SetupUI(UI)
             Name = "Max Distance", Minimum = 50, Maximum = 300,
             Default = AutoShootMaxDistance, Precision = 1,
             Callback = function(v) AutoShootMaxDistance = v end
-        }, "MaxDist")
+        }, "AutoShootMaxDist")
 
         uiElements.AutoShootCurveDistanceLimit = UI.Sections.AutoShoot:Slider({
             Name = "Curve Distance Limit", Minimum = 130, Maximum = 300,
@@ -1544,21 +1565,21 @@ local function SetupUI(UI)
             Name = "Drag Compensation", Minimum = 0, Maximum = 3,
             Default = AutoShootDragComp, Precision = 2,
             Callback = function(v) AutoShootDragComp = v end
-        }, "DragComp")
+        }, "AutoShootDragComp")
         UI.Sections.AutoShoot:SubLabel({Text = "[↑] ball does not reach → increase  | flight away → reduce"})
 
         uiElements.AutoShootDerivMult = UI.Sections.AutoShoot:Slider({
             Name = "Derivation Mult", Minimum = 0.5, Maximum = 10.0,
             Default = AutoShootDerivMult, Precision = 2,
             Callback = function(v) AutoShootDerivMult = v end
-        }, "ADerivMult")
+        }, "AutoShootDerivMult")
 
         UI.Sections.AutoShoot:Divider()
 
         uiElements.AutoShootSpoofPower = UI.Sections.AutoShoot:Toggle({
             Name = "Spoof Power", Default = AutoShootSpoofPowerEnabled,
             Callback = function(v) AutoShootSpoofPowerEnabled = v end
-        }, "ASpoofPower")
+        }, "AutoShootSpoofPower")
 
         uiElements.AutoShootSpoofType = UI.Sections.AutoShoot:Dropdown({
             Name = "Spoof Power Type", Default = AutoShootSpoofPowerType,
@@ -1569,46 +1590,21 @@ local function SetupUI(UI)
         uiElements.AutoShootDebugText = UI.Sections.AutoShoot:Toggle({
             Name = "Debug Text", Default = AutoShootDebugText,
             Callback = function(v) AutoShoot.SetDebugText(v) end
-        }, "ADebugText")
+        }, "AutoShootDebugText")
 
         UI.Sections.AutoShoot:Divider()
         uiElements.ShowTrajectory = UI.Sections.AutoShoot:Toggle({
             Name = "Show Trajectory", Default = ShowTrajectory,
             Callback = function(v) ShowTrajectory = v end
-        }, "ShowTrajectory123")
+        }, "ShowTrajectory")
         uiElements.Show3DBoxes = UI.Sections.AutoShoot:Toggle({
             Name = "Show 3D Boxes", Default = Show3DBoxes,
             Callback = function(v) Show3DBoxes = v end
-        }, "Showbox12")
+        }, "Show3DBoxes")
         uiElements.VisualsOnlyWithBall = UI.Sections.AutoShoot:Toggle({
             Name = "Visuals Only With Ball", Default = VisualsOnlyWithBall,
             Callback = function(v) VisualsOnlyWithBall = v end
-        }, "VOnlyWithall")
-
-        uiElements.TrajectoryColor = UI.Sections.AutoShoot:Colorpicker({
-            Name = "Trajectory Color", Default = TrajectoryColor,
-            Callback = function(v) TrajectoryColor = v; ApplyVisualStyles() end
-        }, "TreoryColoj")
-        uiElements.StartCircleColor = UI.Sections.AutoShoot:Colorpicker({
-            Name = "Start Circle Color", Default = StartCircleColor,
-            Callback = function(v) StartCircleColor = v; ApplyVisualStyles() end
-        }, "StCibcleColor")
-        uiElements.TargetCubeColor = UI.Sections.AutoShoot:Colorpicker({
-            Name = "Aim Box Color", Default = TargetCubeColor,
-            Callback = function(v) TargetCubeColor = v; ApplyVisualStyles() end
-        }, "TargetCkbeCr")
-        uiElements.GoalCubeColor = UI.Sections.AutoShoot:Colorpicker({
-            Name = "Predicted Box Color", Default = GoalCubeColor,
-            Callback = function(v) GoalCubeColor = v; ApplyVisualStyles() end
-        }, "GoabeCoor")
-        uiElements.NoSpinCubeColor = UI.Sections.AutoShoot:Colorpicker({
-            Name = "Goal Frame Color", Default = NoSpinCubeColor,
-            Callback = function(v) NoSpinCubeColor = v; ApplyVisualStyles() end
-        }, "NoSinCubeCor")
-        uiElements.PeakCubeColor = UI.Sections.AutoShoot:Colorpicker({
-            Name = "Peak Box Color", Default = PeakCubeColor,
-            Callback = function(v) PeakCubeColor = v; ApplyVisualStyles() end
-        }, "PeaCubClor")
+        }, "VisualsOnlyWithBall")
     end
 
     if UI.Sections.AutoPickup then
@@ -1618,21 +1614,56 @@ local function SetupUI(UI)
         uiElements.AutoPickupEnabled = UI.Sections.AutoPickup:Toggle({
             Name = "Enabled", Default = AutoPickupEnabled,
             Callback = function(v) AutoPickupEnabled = v; if v then AutoPickup.Start() else AutoPickup.Stop() end end
-        }, "PickupEnabled")
+        }, "AutoPickupEnabled")
 
         uiElements.AutoPickupDist = UI.Sections.AutoPickup:Slider({
             Name = "Pickup Distance", Minimum = 10, Maximum = 300,
             Default = AutoPickupDist, Precision = 1,
             Callback = function(v) AutoPickupDist = v end
-        }, "00Dist")
+        }, "AutoPickupDist")
 
         uiElements.AutoPickupSpoof = UI.Sections.AutoPickup:Slider({
             Name = "Spoof Value", Minimum = 0.1, Maximum = 5.0,
             Default = AutoPickupSpoofValue, Precision = 2,
             Callback = function(v) AutoPickupSpoofValue = v end
-        }, "APickupSpoof")
+        }, "AutoPickupSpoof")
 
         UI.Sections.AutoPickup:SubLabel({Text = "[💠] Distance sent to server for pickup"})
+    end
+
+    -- ═══════════════════════════════════════════════════════════
+    -- Colorpicker'ы — ВСЕГДА В САМОМ КОНЦЕ SetupUI
+    -- Каждый Colorpicker занимает 1 скрытый bool-слот внутри
+    -- библиотеки. Размещение здесь гарантирует, что все Toggle
+    -- выше зарегистрированы с правильными индексами и корректно
+    -- загружаются из конфига.
+    -- ═══════════════════════════════════════════════════════════
+    if UI.Sections.AutoShoot then
+        UI.Sections.AutoShoot:Divider()
+        uiElements.TrajectoryColor = UI.Sections.AutoShoot:Colorpicker({
+            Name = "Trajectory Color", Default = TrajectoryColor,
+            Callback = function(v) TrajectoryColor = v; ApplyVisualStyles() end
+        }, "TrajectoryColor")
+        uiElements.StartCircleColor = UI.Sections.AutoShoot:Colorpicker({
+            Name = "Start Circle Color", Default = StartCircleColor,
+            Callback = function(v) StartCircleColor = v; ApplyVisualStyles() end
+        }, "StartCircleColor")
+        uiElements.TargetCubeColor = UI.Sections.AutoShoot:Colorpicker({
+            Name = "Aim Box Color", Default = TargetCubeColor,
+            Callback = function(v) TargetCubeColor = v; ApplyVisualStyles() end
+        }, "TargetCubeColor")
+        uiElements.GoalCubeColor = UI.Sections.AutoShoot:Colorpicker({
+            Name = "Predicted Box Color", Default = GoalCubeColor,
+            Callback = function(v) GoalCubeColor = v; ApplyVisualStyles() end
+        }, "GoalCubeColor")
+        uiElements.NoSpinCubeColor = UI.Sections.AutoShoot:Colorpicker({
+            Name = "Goal Frame Color", Default = NoSpinCubeColor,
+            Callback = function(v) NoSpinCubeColor = v; ApplyVisualStyles() end
+        }, "NoSpinCubeColor")
+        uiElements.PeakCubeColor = UI.Sections.AutoShoot:Colorpicker({
+            Name = "Peak Box Color", Default = PeakCubeColor,
+            Callback = function(v) PeakCubeColor = v; ApplyVisualStyles() end
+        }, "PeakCubeColor")
     end
 end
 
@@ -1644,6 +1675,8 @@ function AutoShootModule.Init(UI, coreParam, notifyFunc)
     local notify = notifyFunc or function(t,m) print("["..t.."]: "..m) end
     SetupUI(UI)
 
+    -- Синхронизация слайдеров каждую секунду (слайдеры иногда
+    -- не вызывают Callback при загрузке конфига)
     local synchronizationTimer = 0
     RunService.Heartbeat:Connect(function(deltaTime)
         synchronizationTimer += deltaTime
