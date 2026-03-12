@@ -51,13 +51,12 @@ local humanoidConnection
 local uiElements = {}
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- MouseLockController: читаем GetMouseLockOffset() напрямую из модуля.
--- ShiftLock смещает camera.CFrame.Position на Vector3.new(1.75,0,0)
--- в локальном пространстве камеры. Если не компенсировать — проекция
--- всех визуалов уходит в сторону ровно на этот offset.
+-- MouseLockController
+-- Используем IsMouseLocked() — официальный метод, который возвращает true
+-- только когда ShiftLock реально активен (enabled AND isMouseLocked).
+-- Компенсируем offset ТОЛЬКО когда он действительно применён к camera.CFrame.
 -- ─────────────────────────────────────────────────────────────────────────────
 local mouseLockController = nil
-local MOUSE_LOCK_PATH = LocalPlayer:WaitForChild("PlayerScripts",5)
 task.spawn(function()
     local ok, result = pcall(function()
         local ps  = LocalPlayer:WaitForChild("PlayerScripts", 5)
@@ -66,26 +65,25 @@ task.spawn(function()
         local mlc = cm:WaitForChild("MouseLockController", 5)
         return require(mlc)
     end)
-    if ok and result and result.GetMouseLockOffset then
+    if ok and result and result.IsMouseLocked and result.GetMouseLockOffset then
         mouseLockController = result
     end
 end)
 
--- Строим скорректированный CFrame камеры: убираем MouseLockOffset из позиции.
--- Без ShiftLock offset == Vector3.new(0,0,0) → correctedCamCF == camCF (без изменений).
 local function getCorrectedCamCF(camCF)
+    -- Компенсируем offset только если ShiftLock сейчас активен
     if not mouseLockController then return camCF end
-    local ok, offset = pcall(function() return mouseLockController:GetMouseLockOffset() end)
-    if not ok or not offset then return camCF end
-    -- offset в camera-space → переводим в world-space и вычитаем из позиции
+    local ok, isLocked = pcall(function() return mouseLockController:IsMouseLocked() end)
+    if not ok or not isLocked then return camCF end
+    local ok2, offset = pcall(function() return mouseLockController:GetMouseLockOffset() end)
+    if not ok2 or not offset then return camCF end
+    -- offset в camera-space → world-space → вычитаем из позиции камеры
     local worldOffset  = camCF:VectorToWorldSpace(offset)
     local correctedPos = camCF.Position - worldOffset
-    -- Сохраняем ориентацию, меняем только позицию
     return CFrame.new(correctedPos) * (camCF - camCF.Position)
 end
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- Ручная перспективная проекция через скорректированный CFrame.
 local function project(worldPos, camCF, vpX, vpY, tanFovY)
     local lp = camCF:PointToObjectSpace(worldPos)
     if lp.Z >= 0 then return Vector2.new(), false end
@@ -249,7 +247,7 @@ local function animateJump()
     if not State.Circle.JumpAnimate.Value or #circleQuads==0 or jumpAnimationActive then return end
     jumpAnimationActive = true
     task.spawn(function()
-        local t,dur = 0, 0.55
+        local t, dur = 0, 0.55
         local iR = State.Circle.CircleRadius.Value
         local mR = iR * 1.6
         while t < dur do
@@ -314,17 +312,13 @@ local function SynchronizeConfigValues()
     ss(uiElements.NimbYOffset,        State.Nimb.NimbYOffset.Value,           function(v) State.Nimb.NimbYOffset.Value=v            end)
 end
 
--- ─────────────────────────────────────────────────────────────────────────────
--- BindToRenderStep на Camera + 1: читаем camera.CFrame после PlayerModule.
--- getCorrectedCamCF() убирает MouseLockOffset (1.75, 0, 0) из позиции камеры
--- → проекция строится от "реального центра" камеры без ShiftLock-смещения.
--- ─────────────────────────────────────────────────────────────────────────────
 RunService:BindToRenderStep("ChinaHatVisuals", Enum.RenderPriority.Camera.Value + 1, function()
-    local rawCamCF = camera.CFrame
-    local camCF    = getCorrectedCamCF(rawCamCF)   -- убираем MouseLockOffset
-    local vpSize   = camera.ViewportSize
-    local vpX, vpY = vpSize.X, vpSize.Y
-    local tanFovY  = math.tan(math.rad(camera.FieldOfView) * 0.5)
+    -- getCorrectedCamCF внутри проверяет IsMouseLocked() —
+    -- компенсация применяется ТОЛЬКО когда ShiftLock реально активен.
+    local camCF   = getCorrectedCamCF(camera.CFrame)
+    local vpSize  = camera.ViewportSize
+    local vpX,vpY = vpSize.X, vpSize.Y
+    local tanFovY = math.tan(math.rad(camera.FieldOfView) * 0.5)
 
     if localCharacter then
         updateHat   (camCF, vpX, vpY, tanFovY)
