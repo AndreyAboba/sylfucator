@@ -4,7 +4,6 @@ function ChinaHat.Init(UI, Core, notify)
 local Players    = Core.Services.Players
 local RunService = Core.Services.RunService
 local Workspace  = Core.Services.Workspace
-local UserInputService = Core.Services.UserInputService
 local camera     = Workspace.CurrentCamera
 
 local LocalPlayer    = Core.PlayerData.LocalPlayer
@@ -52,31 +51,48 @@ local humanoidConnection
 local uiElements = {}
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- КЛЮЧЕВОЙ ФИЧ: BindToRenderStep с приоритетом Camera + 1
+-- MouseLockController: читаем GetMouseLockOffset() напрямую из модуля.
+-- ShiftLock смещает camera.CFrame.Position на Vector3.new(1.75,0,0)
+-- в локальном пространстве камеры. Если не компенсировать — проекция
+-- всех визуалов уходит в сторону ровно на этот offset.
 -- ─────────────────────────────────────────────────────────────────────────────
--- RenderStepped:Connect() запускается ≈ Priority 0 — ДО PlayerModule.
--- PlayerModule обновляет camera.CFrame (ShiftLock offset) на Priority 300.
--- Все предыдущие версии читали camera.CFrame ДО этого обновления →
--- проекция считалась на СТАРОМ CFrame → визуальный сдвиг.
---
--- После ресета это "случайно" работало, т.к. PlayerModule пересоздаёт
--- свой BindToRenderStep — его slot внутри priority 300 смещается,
--- и camera.CFrame из прошлого кадра уже содержит ShiftLock.
---
--- Решение: BindToRenderStep("ChinaHat", Camera.Value + 1, fn)
--- Гарантирует запуск строго ПОСЛЕ PlayerModule → camera.CFrame всегда актуален.
--- ─────────────────────────────────────────────────────────────────────────────
-local RENDER_PRIORITY = Enum.RenderPriority.Camera.Value + 1
-local RENDER_KEY      = "ChinaHatVisuals"
+local mouseLockController = nil
+local MOUSE_LOCK_PATH = LocalPlayer:WaitForChild("PlayerScripts",5)
+task.spawn(function()
+    local ok, result = pcall(function()
+        local ps  = LocalPlayer:WaitForChild("PlayerScripts", 5)
+        local pm  = ps:WaitForChild("PlayerModule", 5)
+        local cm  = pm:WaitForChild("CameraModule", 5)
+        local mlc = cm:WaitForChild("MouseLockController", 5)
+        return require(mlc)
+    end)
+    if ok and result and result.GetMouseLockOffset then
+        mouseLockController = result
+    end
+end)
 
--- Ручная проекция через camera.CFrame (снапшот начала кадра)
+-- Строим скорректированный CFrame камеры: убираем MouseLockOffset из позиции.
+-- Без ShiftLock offset == Vector3.new(0,0,0) → correctedCamCF == camCF (без изменений).
+local function getCorrectedCamCF(camCF)
+    if not mouseLockController then return camCF end
+    local ok, offset = pcall(function() return mouseLockController:GetMouseLockOffset() end)
+    if not ok or not offset then return camCF end
+    -- offset в camera-space → переводим в world-space и вычитаем из позиции
+    local worldOffset  = camCF:VectorToWorldSpace(offset)
+    local correctedPos = camCF.Position - worldOffset
+    -- Сохраняем ориентацию, меняем только позицию
+    return CFrame.new(correctedPos) * (camCF - camCF.Position)
+end
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Ручная перспективная проекция через скорректированный CFrame.
 local function project(worldPos, camCF, vpX, vpY, tanFovY)
     local lp = camCF:PointToObjectSpace(worldPos)
     if lp.Z >= 0 then return Vector2.new(), false end
     local depth = -lp.Z
     local sx = vpX*0.5 + (lp.X / (depth * tanFovY * (vpX/vpY))) * vpX*0.5
     local sy = vpY*0.5 - (lp.Y / (depth * tanFovY))              * vpY*0.5
-    return Vector2.new(sx, sy), (sx>-100 and sx<vpX+100 and sy>-100 and sy<vpY+100)
+    return Vector2.new(sx, sy), (sx > -100 and sx < vpX+100 and sy > -100 and sy < vpY+100)
 end
 
 local function destroyParts(t)
@@ -107,6 +123,7 @@ local function createHat()
         end
     end
 end
+
 local function createCircle()
     if not localCharacter or not localCharacter:FindFirstChild("HumanoidRootPart") then return end
     destroyParts(circleQuads)
@@ -118,6 +135,7 @@ local function createCircle()
         table.insert(circleQuads, q)
     end
 end
+
 local function createNimb()
     if not localCharacter or not localCharacter:FindFirstChild("HumanoidRootPart") then return end
     destroyParts(nimbQuads)
@@ -137,8 +155,8 @@ local function updateHat(camCF, vpX, vpY, tanFovY)
         return
     end
     local head = localCharacter.Head
-    local y = head.Position.Y + State.ChinaHat.HatYOffset.Value
-    local t = tick()
+    local y    = head.Position.Y + State.ChinaHat.HatYOffset.Value
+    local t    = tick()
     local hatH = 2.15 * State.ChinaHat.HatScale.Value
     local hatR = 1.95 * State.ChinaHat.HatScale.Value
     local n    = State.ChinaHat.HatParts.Value
@@ -147,8 +165,8 @@ local function updateHat(camCF, vpX, vpY, tanFovY)
         local bP = Vector3.new(head.Position.X, y, head.Position.Z)
         local tP = Vector3.new(head.Position.X+math.cos(angle)*hatR, y-hatH/3, head.Position.Z+math.sin(angle)*hatR)
         local eP = tP + (tP-bP).Unit*0.03
-        local s1,os1 = project(bP, camCF, vpX, vpY, tanFovY)
-        local s2,os2 = project(eP, camCF, vpX, vpY, tanFovY)
+        local s1, os1 = project(bP, camCF, vpX, vpY, tanFovY)
+        local s2, os2 = project(eP, camCF, vpX, vpY, tanFovY)
         if os1 and os2 then
             line.From=s1; line.To=s2; line.Visible=true
             if State.ChinaHat.HatGradient.Value then
@@ -157,22 +175,22 @@ local function updateHat(camCF, vpX, vpY, tanFovY)
             else line.Color=State.ChinaHat.HatColor.Value end
         else line.Visible=false end
     end
-    if State.ChinaHat.OutlineCircle.Value and #hatCircleQuads>0 then
-        local tc,cnt = Vector3.new(),0
-        for i,line in ipairs(hatLines) do
+    if State.ChinaHat.OutlineCircle.Value and #hatCircleQuads > 0 then
+        local tc, cnt = Vector3.new(), 0
+        for i, line in ipairs(hatLines) do
             if line.Visible then
-                local a=(i/n)*2*math.pi
-                tc=tc+Vector3.new(head.Position.X+math.cos(a)*hatR,y-hatH/3,head.Position.Z+math.sin(a)*hatR)
-                cnt=cnt+1
+                local a = (i/n)*2*math.pi
+                tc  = tc + Vector3.new(head.Position.X+math.cos(a)*hatR, y-hatH/3, head.Position.Z+math.sin(a)*hatR)
+                cnt = cnt + 1
             end
         end
-        tc = cnt>0 and tc/cnt or Vector3.new(head.Position.X,y-hatH/3,head.Position.Z)
-        local cR = 2.0*State.ChinaHat.HatScale.Value
+        tc = cnt > 0 and tc/cnt or Vector3.new(head.Position.X, y-hatH/3, head.Position.Z)
+        local cR = 2.0 * State.ChinaHat.HatScale.Value
         local nQ = #hatCircleQuads
-        for i,q in ipairs(hatCircleQuads) do
+        for i, q in ipairs(hatCircleQuads) do
             local a1=((i-1)/nQ)*2*math.pi; local a2=(i/nQ)*2*math.pi
-            local sp1,os1 = project(tc+Vector3.new(math.cos(a1)*cR,0,math.sin(a1)*cR), camCF,vpX,vpY,tanFovY)
-            local sp2,os2 = project(tc+Vector3.new(math.cos(a2)*cR,0,math.sin(a2)*cR), camCF,vpX,vpY,tanFovY)
+            local sp1,os1=project(tc+Vector3.new(math.cos(a1)*cR,0,math.sin(a1)*cR),camCF,vpX,vpY,tanFovY)
+            local sp2,os2=project(tc+Vector3.new(math.cos(a2)*cR,0,math.sin(a2)*cR),camCF,vpX,vpY,tanFovY)
             if os1 and os2 then
                 q.PointA=sp1;q.PointB=sp2;q.PointC=sp2;q.PointD=sp1;q.Visible=true
                 if State.ChinaHat.HatGradient.Value then
@@ -189,12 +207,12 @@ local function updateCircle(camCF, vpX, vpY, tanFovY)
         for _,q in ipairs(circleQuads) do q.Visible=false end; return
     end
     local rp     = localCharacter.HumanoidRootPart
-    local center = Vector3.new(rp.Position.X, rp.Position.Y+State.Circle.CircleYOffset.Value, rp.Position.Z)
+    local center = Vector3.new(rp.Position.X, rp.Position.Y + State.Circle.CircleYOffset.Value, rp.Position.Z)
     local t,r,n  = tick(), State.Circle.CircleRadius.Value, #circleQuads
-    for i,q in ipairs(circleQuads) do
+    for i, q in ipairs(circleQuads) do
         local a1=((i-1)/n)*2*math.pi; local a2=(i/n)*2*math.pi
-        local sp1,os1 = project(center+Vector3.new(math.cos(a1)*r,0,math.sin(a1)*r), camCF,vpX,vpY,tanFovY)
-        local sp2,os2 = project(center+Vector3.new(math.cos(a2)*r,0,math.sin(a2)*r), camCF,vpX,vpY,tanFovY)
+        local sp1,os1=project(center+Vector3.new(math.cos(a1)*r,0,math.sin(a1)*r),camCF,vpX,vpY,tanFovY)
+        local sp2,os2=project(center+Vector3.new(math.cos(a2)*r,0,math.sin(a2)*r),camCF,vpX,vpY,tanFovY)
         if os1 and os2 then
             q.PointA=sp1;q.PointB=sp2;q.PointC=sp2;q.PointD=sp1;q.Visible=true
             if State.Circle.CircleGradient.Value then
@@ -211,12 +229,12 @@ local function updateNimb(camCF, vpX, vpY, tanFovY)
     end
     local head = localCharacter:FindFirstChild("Head")
     if not head then for _,q in ipairs(nimbQuads) do q.Visible=false end; return end
-    local center = Vector3.new(head.Position.X, head.Position.Y+State.Nimb.NimbYOffset.Value, head.Position.Z)
+    local center = Vector3.new(head.Position.X, head.Position.Y + State.Nimb.NimbYOffset.Value, head.Position.Z)
     local t,r,n  = tick(), State.Nimb.NimbRadius.Value, #nimbQuads
-    for i,q in ipairs(nimbQuads) do
+    for i, q in ipairs(nimbQuads) do
         local a1=((i-1)/n)*2*math.pi; local a2=(i/n)*2*math.pi
-        local sp1,os1 = project(center+Vector3.new(math.cos(a1)*r,0,math.sin(a1)*r), camCF,vpX,vpY,tanFovY)
-        local sp2,os2 = project(center+Vector3.new(math.cos(a2)*r,0,math.sin(a2)*r), camCF,vpX,vpY,tanFovY)
+        local sp1,os1=project(center+Vector3.new(math.cos(a1)*r,0,math.sin(a1)*r),camCF,vpX,vpY,tanFovY)
+        local sp2,os2=project(center+Vector3.new(math.cos(a2)*r,0,math.sin(a2)*r),camCF,vpX,vpY,tanFovY)
         if os1 and os2 then
             q.PointA=sp1;q.PointB=sp2;q.PointC=sp2;q.PointD=sp1;q.Visible=true
             if State.Nimb.NimbGradient.Value then
@@ -229,49 +247,50 @@ end
 
 local function animateJump()
     if not State.Circle.JumpAnimate.Value or #circleQuads==0 or jumpAnimationActive then return end
-    jumpAnimationActive=true
+    jumpAnimationActive = true
     task.spawn(function()
-        local t,dur=0,0.55
-        local iR=State.Circle.CircleRadius.Value
-        local mR=iR*1.6
-        while t<dur do
-            local dt=RunService.RenderStepped:Wait(); t=t+dt
-            State.Circle.CircleRadius.Value=iR+(mR-iR)*math.sin((t/dur)*math.pi)
+        local t,dur = 0, 0.55
+        local iR = State.Circle.CircleRadius.Value
+        local mR = iR * 1.6
+        while t < dur do
+            local dt = RunService.RenderStepped:Wait(); t = t + dt
+            State.Circle.CircleRadius.Value = iR + (mR-iR) * math.sin((t/dur)*math.pi)
         end
-        State.Circle.CircleRadius.Value=iR; jumpAnimationActive=false
+        State.Circle.CircleRadius.Value = iR
+        jumpAnimationActive = false
     end)
 end
 
 local function toggleHat(v)
-    State.ChinaHat.HatActive.Value=v
-    if v then createHat();notify("ChinaHat","Hat Enabled",true)
-    else destroyParts(hatLines);destroyParts(hatCircleQuads);notify("ChinaHat","Hat Disabled",true) end
+    State.ChinaHat.HatActive.Value = v
+    if v then createHat(); notify("ChinaHat","Hat Enabled",true)
+    else destroyParts(hatLines); destroyParts(hatCircleQuads); notify("ChinaHat","Hat Disabled",true) end
 end
 local function toggleCircle(v)
-    State.Circle.CircleActive.Value=v
-    if v then createCircle();notify("Circle","Circle Enabled",true)
-    else destroyParts(circleQuads);notify("Circle","Circle Disabled",true) end
+    State.Circle.CircleActive.Value = v
+    if v then createCircle(); notify("Circle","Circle Enabled",true)
+    else destroyParts(circleQuads); notify("Circle","Circle Disabled",true) end
 end
 local function toggleNimb(v)
-    State.Nimb.NimbActive.Value=v
-    if v then createNimb();notify("Nimb","Nimb Enabled",true)
-    else destroyParts(nimbQuads);notify("Nimb","Nimb Disabled",true) end
+    State.Nimb.NimbActive.Value = v
+    if v then createNimb(); notify("Nimb","Nimb Enabled",true)
+    else destroyParts(nimbQuads); notify("Nimb","Nimb Disabled",true) end
 end
 
-local function onStateChanged(_,ns)
-    if State.Circle.JumpAnimate.Value and ns==Enum.HumanoidStateType.Jumping and not jumpAnimationActive then
+local function onStateChanged(_, ns)
+    if State.Circle.JumpAnimate.Value and ns == Enum.HumanoidStateType.Jumping and not jumpAnimationActive then
         animateJump()
     end
 end
 
 local function connectHumanoid(character)
     if humanoidConnection then humanoidConnection:Disconnect() end
-    localCharacter=character
-    camera=Workspace.CurrentCamera
-    local hum=character:WaitForChild("Humanoid",5)
+    localCharacter = character
+    camera = Workspace.CurrentCamera
+    local hum = character:WaitForChild("Humanoid", 5)
     if hum then
-        localHumanoid=hum
-        humanoidConnection=hum.StateChanged:Connect(onStateChanged)
+        localHumanoid = hum
+        humanoidConnection = hum.StateChanged:Connect(onStateChanged)
     end
     if State.ChinaHat.HatActive.Value  then createHat()   end
     if State.Circle.CircleActive.Value then createCircle() end
@@ -280,44 +299,44 @@ end
 
 local function SynchronizeConfigValues()
     if not uiElements then return end
-    local function ss(e,cur,fn) if e and e.GetValue then local v=e:GetValue();if v~=cur then fn(v) end end end
-    ss(uiElements.HatScale,          State.ChinaHat.HatScale.Value,          function(v) State.ChinaHat.HatScale.Value=v;          if State.ChinaHat.HatActive.Value  then createHat()   end end)
-    ss(uiElements.HatParts,          State.ChinaHat.HatParts.Value,          function(v) State.ChinaHat.HatParts.Value=v;          if State.ChinaHat.HatActive.Value  then createHat()   end end)
-    ss(uiElements.HatGradientSpeed,  State.ChinaHat.HatGradientSpeed.Value,  function(v) State.ChinaHat.HatGradientSpeed.Value=v   end)
-    ss(uiElements.HatYOffset,        State.ChinaHat.HatYOffset.Value,        function(v) State.ChinaHat.HatYOffset.Value=v         end)
-    ss(uiElements.CircleRadius,      State.Circle.CircleRadius.Value,        function(v) State.Circle.CircleRadius.Value=v;        if State.Circle.CircleActive.Value then createCircle() end end)
-    ss(uiElements.CircleParts,       State.Circle.CircleParts.Value,         function(v) State.Circle.CircleParts.Value=v;         if State.Circle.CircleActive.Value then createCircle() end end)
-    ss(uiElements.CircleGradientSpeed,State.Circle.CircleGradientSpeed.Value,function(v) State.Circle.CircleGradientSpeed.Value=v  end)
-    ss(uiElements.CircleYOffset,     State.Circle.CircleYOffset.Value,       function(v) State.Circle.CircleYOffset.Value=v        end)
-    ss(uiElements.NimbRadius,        State.Nimb.NimbRadius.Value,            function(v) State.Nimb.NimbRadius.Value=v;            if State.Nimb.NimbActive.Value     then createNimb()   end end)
-    ss(uiElements.NimbParts,         State.Nimb.NimbParts.Value,             function(v) State.Nimb.NimbParts.Value=v;             if State.Nimb.NimbActive.Value     then createNimb()   end end)
-    ss(uiElements.NimbGradientSpeed, State.Nimb.NimbGradientSpeed.Value,     function(v) State.Nimb.NimbGradientSpeed.Value=v      end)
-    ss(uiElements.NimbYOffset,       State.Nimb.NimbYOffset.Value,           function(v) State.Nimb.NimbYOffset.Value=v            end)
+    local function ss(e, cur, fn) if e and e.GetValue then local v=e:GetValue(); if v~=cur then fn(v) end end end
+    ss(uiElements.HatScale,           State.ChinaHat.HatScale.Value,          function(v) State.ChinaHat.HatScale.Value=v;          if State.ChinaHat.HatActive.Value  then createHat()   end end)
+    ss(uiElements.HatParts,           State.ChinaHat.HatParts.Value,          function(v) State.ChinaHat.HatParts.Value=v;          if State.ChinaHat.HatActive.Value  then createHat()   end end)
+    ss(uiElements.HatGradientSpeed,   State.ChinaHat.HatGradientSpeed.Value,  function(v) State.ChinaHat.HatGradientSpeed.Value=v   end)
+    ss(uiElements.HatYOffset,         State.ChinaHat.HatYOffset.Value,        function(v) State.ChinaHat.HatYOffset.Value=v         end)
+    ss(uiElements.CircleRadius,       State.Circle.CircleRadius.Value,        function(v) State.Circle.CircleRadius.Value=v;        if State.Circle.CircleActive.Value then createCircle() end end)
+    ss(uiElements.CircleParts,        State.Circle.CircleParts.Value,         function(v) State.Circle.CircleParts.Value=v;         if State.Circle.CircleActive.Value then createCircle() end end)
+    ss(uiElements.CircleGradientSpeed,State.Circle.CircleGradientSpeed.Value, function(v) State.Circle.CircleGradientSpeed.Value=v  end)
+    ss(uiElements.CircleYOffset,      State.Circle.CircleYOffset.Value,       function(v) State.Circle.CircleYOffset.Value=v        end)
+    ss(uiElements.NimbRadius,         State.Nimb.NimbRadius.Value,            function(v) State.Nimb.NimbRadius.Value=v;            if State.Nimb.NimbActive.Value     then createNimb()   end end)
+    ss(uiElements.NimbParts,          State.Nimb.NimbParts.Value,             function(v) State.Nimb.NimbParts.Value=v;             if State.Nimb.NimbActive.Value     then createNimb()   end end)
+    ss(uiElements.NimbGradientSpeed,  State.Nimb.NimbGradientSpeed.Value,     function(v) State.Nimb.NimbGradientSpeed.Value=v      end)
+    ss(uiElements.NimbYOffset,        State.Nimb.NimbYOffset.Value,           function(v) State.Nimb.NimbYOffset.Value=v            end)
 end
 
--- ── BindToRenderStep: Camera.Value + 1 ───────────────────────────────────────
--- PlayerModule обновляет camera.CFrame на Enum.RenderPriority.Camera.Value (300).
--- Мы запускаемся на 301 — строго ПОСЛЕ PlayerModule.
--- RenderStepped:Connect() (который использовался ранее) запускается на приоритете ~0,
--- ДО PlayerModule, поэтому camera.CFrame был устаревшим — отсюда смещение.
-RunService:BindToRenderStep(RENDER_KEY, RENDER_PRIORITY, function()
-    local camCF   = camera.CFrame          -- гарантированно актуален: ShiftLock уже применён
-    local vpSize  = camera.ViewportSize
-    local vpX,vpY = vpSize.X, vpSize.Y
-    local tanFovY = math.tan(math.rad(camera.FieldOfView)*0.5)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- BindToRenderStep на Camera + 1: читаем camera.CFrame после PlayerModule.
+-- getCorrectedCamCF() убирает MouseLockOffset (1.75, 0, 0) из позиции камеры
+-- → проекция строится от "реального центра" камеры без ShiftLock-смещения.
+-- ─────────────────────────────────────────────────────────────────────────────
+RunService:BindToRenderStep("ChinaHatVisuals", Enum.RenderPriority.Camera.Value + 1, function()
+    local rawCamCF = camera.CFrame
+    local camCF    = getCorrectedCamCF(rawCamCF)   -- убираем MouseLockOffset
+    local vpSize   = camera.ViewportSize
+    local vpX, vpY = vpSize.X, vpSize.Y
+    local tanFovY  = math.tan(math.rad(camera.FieldOfView) * 0.5)
 
     if localCharacter then
-        updateHat(camCF,vpX,vpY,tanFovY)
-        updateCircle(camCF,vpX,vpY,tanFovY)
-        updateNimb(camCF,vpX,vpY,tanFovY)
+        updateHat   (camCF, vpX, vpY, tanFovY)
+        updateCircle(camCF, vpX, vpY, tanFovY)
+        updateNimb  (camCF, vpX, vpY, tanFovY)
     else
-        for _,l in ipairs(hatLines)      do l.Visible=false end
-        for _,q in ipairs(hatCircleQuads)do q.Visible=false end
-        for _,q in ipairs(circleQuads)   do q.Visible=false end
-        for _,q in ipairs(nimbQuads)     do q.Visible=false end
+        for _,l in ipairs(hatLines)       do l.Visible=false end
+        for _,q in ipairs(hatCircleQuads) do q.Visible=false end
+        for _,q in ipairs(circleQuads)    do q.Visible=false end
+        for _,q in ipairs(nimbQuads)      do q.Visible=false end
     end
 end)
--- ─────────────────────────────────────────────────────────────────────────────
 
 LocalPlayer.CharacterAdded:Connect(connectHumanoid)
 if localCharacter then
@@ -327,60 +346,61 @@ else
 end
 
 if UI.Tabs and UI.Tabs.Visuals then
-    local chS=UI.Sections.ChinaHat or UI.Tabs.Visuals:Section({Name="ChinaHat",Side="Left"})
-    UI.Sections.ChinaHat=chS
+    local chS = UI.Sections.ChinaHat or UI.Tabs.Visuals:Section({Name="ChinaHat",Side="Left"})
+    UI.Sections.ChinaHat = chS
     chS:Header({Name="China Hat"}); chS:SubLabel({Text="Displays a hat above the player head"})
-    uiElements.HatEnabled       =chS:Toggle({Name="Enabled",Default=State.ChinaHat.HatActive.Default,Callback=function(v) toggleHat(v) end},"HatEnabled")
+    uiElements.HatEnabled       = chS:Toggle({Name="Enabled",Default=State.ChinaHat.HatActive.Default,Callback=function(v) toggleHat(v) end},"HatEnabled")
     chS:Divider()
-    uiElements.HatScale         =chS:Slider({Name="Scale",Minimum=0.5,Maximum=2.0,Default=State.ChinaHat.HatScale.Default,Precision=2,Callback=function(v) State.ChinaHat.HatScale.Value=v;if State.ChinaHat.HatActive.Value then createHat() end;notify("ChinaHat","Scale: "..v,false) end},"HatScale")
-    uiElements.HatParts         =chS:Slider({Name="Parts",Minimum=20,Maximum=150,Default=State.ChinaHat.HatParts.Value,Precision=0,Callback=function(v) State.ChinaHat.HatParts.Value=v;if State.ChinaHat.HatActive.Value then createHat() end;notify("ChinaHat","Parts: "..v,false) end},"HatParts")
+    uiElements.HatScale         = chS:Slider({Name="Scale",Minimum=0.5,Maximum=2.0,Default=State.ChinaHat.HatScale.Default,Precision=2,Callback=function(v) State.ChinaHat.HatScale.Value=v;if State.ChinaHat.HatActive.Value then createHat() end;notify("ChinaHat","Scale: "..v,false) end},"HatScale")
+    uiElements.HatParts         = chS:Slider({Name="Parts",Minimum=20,Maximum=150,Default=State.ChinaHat.HatParts.Value,Precision=0,Callback=function(v) State.ChinaHat.HatParts.Value=v;if State.ChinaHat.HatActive.Value then createHat() end;notify("ChinaHat","Parts: "..v,false) end},"HatParts")
     chS:Divider()
-    uiElements.HatGradientSpeed =chS:Slider({Name="Gradient Speed",Minimum=1,Maximum=10,Default=State.ChinaHat.HatGradientSpeed.Default,Precision=1,Callback=function(v) State.ChinaHat.HatGradientSpeed.Value=v;notify("ChinaHat","Gradient Speed: "..v,false) end},"HatGradientSpeed")
-    uiElements.HatGradient      =chS:Toggle({Name="Gradient",Default=State.ChinaHat.HatGradient.Default,Callback=function(v) State.ChinaHat.HatGradient.Value=v;if State.ChinaHat.HatActive.Value then createHat() end;notify("ChinaHat","Gradient: "..(v and"On"or"Off"),true) end},"HatGradient")
-    uiElements.HatColor         =chS:Colorpicker({Name="Color",Default=State.ChinaHat.HatColor.Default,Callback=function(v) State.ChinaHat.HatColor.Value=v;if State.ChinaHat.HatActive.Value and not State.ChinaHat.HatGradient.Value then createHat() end;notify("ChinaHat","Color updated",false) end},"HatColor")
+    uiElements.HatGradientSpeed = chS:Slider({Name="Gradient Speed",Minimum=1,Maximum=10,Default=State.ChinaHat.HatGradientSpeed.Default,Precision=1,Callback=function(v) State.ChinaHat.HatGradientSpeed.Value=v;notify("ChinaHat","Gradient Speed: "..v,false) end},"HatGradientSpeed")
+    uiElements.HatGradient      = chS:Toggle({Name="Gradient",Default=State.ChinaHat.HatGradient.Default,Callback=function(v) State.ChinaHat.HatGradient.Value=v;if State.ChinaHat.HatActive.Value then createHat() end;notify("ChinaHat","Gradient: "..(v and"On"or"Off"),true) end},"HatGradient")
+    uiElements.HatColor         = chS:Colorpicker({Name="Color",Default=State.ChinaHat.HatColor.Default,Callback=function(v) State.ChinaHat.HatColor.Value=v;if State.ChinaHat.HatActive.Value and not State.ChinaHat.HatGradient.Value then createHat() end;notify("ChinaHat","Color updated",false) end},"HatColor")
     chS:Divider()
-    uiElements.HatYOffset       =chS:Slider({Name="Y Offset",Minimum=-5,Maximum=5,Default=State.ChinaHat.HatYOffset.Default,Precision=2,Callback=function(v) State.ChinaHat.HatYOffset.Value=v;notify("ChinaHat","Y Offset: "..v,false) end},"HatYOffset")
-    uiElements.OutlineCircle    =chS:Toggle({Name="Outline Circle",Default=State.ChinaHat.OutlineCircle.Default,Callback=function(v) State.ChinaHat.OutlineCircle.Value=v;if State.ChinaHat.HatActive.Value then createHat() end;notify("ChinaHat","Outline: "..(v and"On"or"Off"),true) end},"OutlineCircle")
+    uiElements.HatYOffset       = chS:Slider({Name="Y Offset",Minimum=-5,Maximum=5,Default=State.ChinaHat.HatYOffset.Default,Precision=2,Callback=function(v) State.ChinaHat.HatYOffset.Value=v;notify("ChinaHat","Y Offset: "..v,false) end},"HatYOffset")
+    uiElements.OutlineCircle    = chS:Toggle({Name="Outline Circle",Default=State.ChinaHat.OutlineCircle.Default,Callback=function(v) State.ChinaHat.OutlineCircle.Value=v;if State.ChinaHat.HatActive.Value then createHat() end;notify("ChinaHat","Outline: "..(v and"On"or"Off"),true) end},"OutlineCircle")
 
-    local cS=UI.Sections.Circle or UI.Tabs.Visuals:Section({Name="Circle",Side="Left"})
-    UI.Sections.Circle=cS
+    local cS = UI.Sections.Circle or UI.Tabs.Visuals:Section({Name="Circle",Side="Left"})
+    UI.Sections.Circle = cS
     cS:Header({Name="Circle"}); cS:SubLabel({Text="Displays a circle at the player feet"})
-    uiElements.CircleEnabled       =cS:Toggle({Name="Enabled",Default=State.Circle.CircleActive.Default,Callback=function(v) toggleCircle(v) end},"CircleEnabled")
+    uiElements.CircleEnabled        = cS:Toggle({Name="Enabled",Default=State.Circle.CircleActive.Default,Callback=function(v) toggleCircle(v) end},"CircleEnabled")
     cS:Divider()
-    uiElements.CircleRadius        =cS:Slider({Name="Radius",Minimum=1.0,Maximum=3.0,Default=State.Circle.CircleRadius.Default,Precision=1,Callback=function(v) State.Circle.CircleRadius.Value=v;if State.Circle.CircleActive.Value then createCircle() end;notify("Circle","Radius: "..v,false) end},"CircleRadius")
-    uiElements.CircleParts         =cS:Slider({Name="Parts",Minimum=20,Maximum=100,Default=State.Circle.CircleParts.Default,Precision=0,Callback=function(v) State.Circle.CircleParts.Value=v;if State.Circle.CircleActive.Value then createCircle() end;notify("Circle","Parts: "..v,false) end},"CircleParts")
+    uiElements.CircleRadius         = cS:Slider({Name="Radius",Minimum=1.0,Maximum=3.0,Default=State.Circle.CircleRadius.Default,Precision=1,Callback=function(v) State.Circle.CircleRadius.Value=v;if State.Circle.CircleActive.Value then createCircle() end;notify("Circle","Radius: "..v,false) end},"CircleRadius")
+    uiElements.CircleParts          = cS:Slider({Name="Parts",Minimum=20,Maximum=100,Default=State.Circle.CircleParts.Default,Precision=0,Callback=function(v) State.Circle.CircleParts.Value=v;if State.Circle.CircleActive.Value then createCircle() end;notify("Circle","Parts: "..v,false) end},"CircleParts")
     cS:Divider()
-    uiElements.CircleGradientSpeed =cS:Slider({Name="Gradient Speed",Minimum=1,Maximum=10,Default=State.Circle.CircleGradientSpeed.Default,Precision=1,Callback=function(v) State.Circle.CircleGradientSpeed.Value=v;notify("Circle","Gradient Speed: "..v,false) end},"CircleGradientSpeed")
-    uiElements.CircleGradient      =cS:Toggle({Name="Gradient",Default=State.Circle.CircleGradient.Default,Callback=function(v) State.Circle.CircleGradient.Value=v;if State.Circle.CircleActive.Value then createCircle() end;notify("Circle","Gradient: "..(v and"On"or"Off"),true) end},"CircleGradient")
-    uiElements.CircleColor         =cS:Colorpicker({Name="Color",Default=State.Circle.CircleColor.Default,Callback=function(v) State.Circle.CircleColor.Value=v;if State.Circle.CircleActive.Value and not State.Circle.CircleGradient.Value then createCircle() end;notify("Circle","Color updated",false) end},"CircleColor")
+    uiElements.CircleGradientSpeed  = cS:Slider({Name="Gradient Speed",Minimum=1,Maximum=10,Default=State.Circle.CircleGradientSpeed.Default,Precision=1,Callback=function(v) State.Circle.CircleGradientSpeed.Value=v;notify("Circle","Gradient Speed: "..v,false) end},"CircleGradientSpeed")
+    uiElements.CircleGradient       = cS:Toggle({Name="Gradient",Default=State.Circle.CircleGradient.Default,Callback=function(v) State.Circle.CircleGradient.Value=v;if State.Circle.CircleActive.Value then createCircle() end;notify("Circle","Gradient: "..(v and"On"or"Off"),true) end},"CircleGradient")
+    uiElements.CircleColor          = cS:Colorpicker({Name="Color",Default=State.Circle.CircleColor.Default,Callback=function(v) State.Circle.CircleColor.Value=v;if State.Circle.CircleActive.Value and not State.Circle.CircleGradient.Value then createCircle() end;notify("Circle","Color updated",false) end},"CircleColor")
     cS:Divider()
-    uiElements.JumpAnimate         =cS:Toggle({Name="Jump Animate",Default=State.Circle.JumpAnimate.Default,Callback=function(v) State.Circle.JumpAnimate.Value=v;notify("Circle","Jump Animate: "..(v and"On"or"Off"),true) end},"JumpAnimate")
-    uiElements.CircleYOffset       =cS:Slider({Name="Y Offset",Minimum=-5,Maximum=0,Default=State.Circle.CircleYOffset.Default,Precision=1,Callback=function(v) State.Circle.CircleYOffset.Value=v;notify("Circle","Y Offset: "..v,false) end},"CircleYOffset")
+    uiElements.JumpAnimate          = cS:Toggle({Name="Jump Animate",Default=State.Circle.JumpAnimate.Default,Callback=function(v) State.Circle.JumpAnimate.Value=v;notify("Circle","Jump Animate: "..(v and"On"or"Off"),true) end},"JumpAnimate")
+    uiElements.CircleYOffset        = cS:Slider({Name="Y Offset",Minimum=-5,Maximum=0,Default=State.Circle.CircleYOffset.Default,Precision=1,Callback=function(v) State.Circle.CircleYOffset.Value=v;notify("Circle","Y Offset: "..v,false) end},"CircleYOffset")
 
-    local nS=UI.Sections.Nimb or UI.Tabs.Visuals:Section({Name="Nimb",Side="Right"})
-    UI.Sections.Nimb=nS
+    local nS = UI.Sections.Nimb or UI.Tabs.Visuals:Section({Name="Nimb",Side="Right"})
+    UI.Sections.Nimb = nS
     nS:Header({Name="Nimb"}); nS:SubLabel({Text="Displays a circle above the player head"})
-    uiElements.NimbEnabled        =nS:Toggle({Name="Nimb Enabled",Default=State.Nimb.NimbActive.Default,Callback=function(v) toggleNimb(v) end},"NimbEnabled")
+    uiElements.NimbEnabled        = nS:Toggle({Name="Nimb Enabled",Default=State.Nimb.NimbActive.Default,Callback=function(v) toggleNimb(v) end},"NimbEnabled")
     nS:Divider()
-    uiElements.NimbRadius         =nS:Slider({Name="Radius",Minimum=1.0,Maximum=3.0,Default=State.Nimb.NimbRadius.Default,Precision=1,Callback=function(v) State.Nimb.NimbRadius.Value=v;if State.Nimb.NimbActive.Value then createNimb() end;notify("Nimb","Radius: "..v,false) end},"NimbRadius")
-    uiElements.NimbParts          =nS:Slider({Name="Parts",Minimum=20,Maximum=100,Default=State.Nimb.NimbParts.Default,Precision=0,Callback=function(v) State.Nimb.NimbParts.Value=v;if State.Nimb.NimbActive.Value then createNimb() end;notify("Nimb","Parts: "..v,false) end},"NimbParts")
+    uiElements.NimbRadius         = nS:Slider({Name="Radius",Minimum=1.0,Maximum=3.0,Default=State.Nimb.NimbRadius.Default,Precision=1,Callback=function(v) State.Nimb.NimbRadius.Value=v;if State.Nimb.NimbActive.Value then createNimb() end;notify("Nimb","Radius: "..v,false) end},"NimbRadius")
+    uiElements.NimbParts          = nS:Slider({Name="Parts",Minimum=20,Maximum=100,Default=State.Nimb.NimbParts.Default,Precision=0,Callback=function(v) State.Nimb.NimbParts.Value=v;if State.Nimb.NimbActive.Value then createNimb() end;notify("Nimb","Parts: "..v,false) end},"NimbParts")
     nS:Divider()
-    uiElements.NimbGradientSpeed  =nS:Slider({Name="Gradient Speed",Minimum=1,Maximum=10,Default=State.Nimb.NimbGradientSpeed.Default,Precision=1,Callback=function(v) State.Nimb.NimbGradientSpeed.Value=v;notify("Nimb","Gradient Speed: "..v,false) end},"NimbGradientSpeed")
-    uiElements.NimbGradient       =nS:Toggle({Name="Gradient",Default=State.Nimb.NimbGradient.Default,Callback=function(v) State.Nimb.NimbGradient.Value=v;if State.Nimb.NimbActive.Value then createNimb() end;notify("Nimb","Gradient: "..(v and"On"or"Off"),true) end},"NimbGradient")
-    uiElements.NimbColor          =nS:Colorpicker({Name="Color",Default=State.Nimb.NimbColor.Default,Callback=function(v) State.Nimb.NimbColor.Value=v;if State.Nimb.NimbActive.Value and not State.Nimb.NimbGradient.Value then createNimb() end;notify("Nimb","Color updated",false) end},"NimbColor")
+    uiElements.NimbGradientSpeed  = nS:Slider({Name="Gradient Speed",Minimum=1,Maximum=10,Default=State.Nimb.NimbGradientSpeed.Default,Precision=1,Callback=function(v) State.Nimb.NimbGradientSpeed.Value=v;notify("Nimb","Gradient Speed: "..v,false) end},"NimbGradientSpeed")
+    uiElements.NimbGradient       = nS:Toggle({Name="Gradient",Default=State.Nimb.NimbGradient.Default,Callback=function(v) State.Nimb.NimbGradient.Value=v;if State.Nimb.NimbActive.Value then createNimb() end;notify("Nimb","Gradient: "..(v and"On"or"Off"),true) end},"NimbGradient")
+    uiElements.NimbColor          = nS:Colorpicker({Name="Color",Default=State.Nimb.NimbColor.Default,Callback=function(v) State.Nimb.NimbColor.Value=v;if State.Nimb.NimbActive.Value and not State.Nimb.NimbGradient.Value then createNimb() end;notify("Nimb","Color updated",false) end},"NimbColor")
     nS:Divider()
-    uiElements.NimbYOffset        =nS:Slider({Name="Y Offset",Minimum=0,Maximum=5,Default=State.Nimb.NimbYOffset.Default,Precision=1,Callback=function(v) State.Nimb.NimbYOffset.Value=v;notify("Nimb","Y Offset: "..v,false) end},"NimbYOffset")
+    uiElements.NimbYOffset        = nS:Slider({Name="Y Offset",Minimum=0,Maximum=5,Default=State.Nimb.NimbYOffset.Default,Precision=1,Callback=function(v) State.Nimb.NimbYOffset.Value=v;notify("Nimb","Y Offset: "..v,false) end},"NimbYOffset")
 end
 
-local syncTimer=0
+local syncTimer = 0
 RunService.Heartbeat:Connect(function(dt)
-    syncTimer=syncTimer+dt; if syncTimer>=0.5 then syncTimer=0; SynchronizeConfigValues() end
+    syncTimer = syncTimer + dt
+    if syncTimer >= 0.5 then syncTimer = 0; SynchronizeConfigValues() end
 end)
 
 function ChinaHat:Destroy()
-    RunService:UnbindFromRenderStep(RENDER_KEY)
-    destroyParts(hatLines);destroyParts(hatCircleQuads)
-    destroyParts(circleQuads);destroyParts(nimbQuads)
+    RunService:UnbindFromRenderStep("ChinaHatVisuals")
+    destroyParts(hatLines); destroyParts(hatCircleQuads)
+    destroyParts(circleQuads); destroyParts(nimbQuads)
     if humanoidConnection then humanoidConnection:Disconnect() end
 end
 
