@@ -51,36 +51,45 @@ local humanoidConnection
 local uiElements = {}
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- MouseLockController
--- Используем IsMouseLocked() — официальный метод, который возвращает true
--- только когда ShiftLock реально активен (enabled AND isMouseLocked).
--- Компенсируем offset ТОЛЬКО когда он действительно применён к camera.CFrame.
+-- ShiftLock детекция и компенсация — финальный подход
 -- ─────────────────────────────────────────────────────────────────────────────
-local mouseLockController = nil
-task.spawn(function()
-    local ok, result = pcall(function()
-        local ps  = LocalPlayer:WaitForChild("PlayerScripts", 5)
-        local pm  = ps:WaitForChild("PlayerModule", 5)
-        local cm  = pm:WaitForChild("CameraModule", 5)
-        local mlc = cm:WaitForChild("MouseLockController", 5)
-        return require(mlc)
-    end)
-    if ok and result and result.IsMouseLocked and result.GetMouseLockOffset then
-        mouseLockController = result
-    end
-end)
+-- require(MouseLockController) возвращает КЛАСС (v_u_10), а не инстанс.
+-- Инстанс создаётся внутри CameraModule как u33.activeMouseLockController = u23.new()
+-- и хранится в замыкании — снаружи недоступен.
+-- CameraModule.new() возвращает {} — инстанс тоже не достать.
+--
+-- Поэтому не используем MouseLockController вообще.
+--
+-- Детекция через геометрию camera.CFrame:
+--   При ShiftLock камера смотрит НЕ прямо на HRP, а чуть левее
+--   (т.к. offset 1.75 вправо сдвигает фокус). Вычисляем вектор
+--   от камеры до HRP в camera-space: если X значительно смещён —
+--   ShiftLock активен.
+--
+-- Компенсация:
+--   Знаем точный offset из кода: Vector3.new(1.75, 0, 0) в camera-space.
+--   Если ShiftLock активен — вычитаем его из позиции камеры.
+-- ─────────────────────────────────────────────────────────────────────────────
+local SHIFTLOCK_OFFSET = Vector3.new(1.75, 0, 0)  -- из GetMouseLockOffset()
+-- Порог детекции: если X-компонент вектора камера→HRP в cam-space
+-- близок к -1.75 (с учётом дистанции) — ShiftLock активен.
+-- Используем абсолютное смещение в cam-space, не зависящее от дистанции.
+local SHIFTLOCK_THRESHOLD = 1.2  -- половина от 1.75, с запасом
 
-local function getCorrectedCamCF(camCF)
-    -- Компенсируем offset только если ShiftLock сейчас активен
-    if not mouseLockController then return camCF end
-    local ok, isLocked = pcall(function() return mouseLockController:IsMouseLocked() end)
-    if not ok or not isLocked then return camCF end
-    local ok2, offset = pcall(function() return mouseLockController:GetMouseLockOffset() end)
-    if not ok2 or not offset then return camCF end
-    -- offset в camera-space → world-space → вычитаем из позиции камеры
-    local worldOffset  = camCF:VectorToWorldSpace(offset)
-    local correctedPos = camCF.Position - worldOffset
-    return CFrame.new(correctedPos) * (camCF - camCF.Position)
+local function getCorrectedCamCF(camCF, hrpPos)
+    if not hrpPos then return camCF end
+    -- Переводим HRP в пространство камеры
+    local localHRP = camCF:PointToObjectSpace(hrpPos)
+    -- При ShiftLock: камера сдвинута на +1.75 вправо в cam-space →
+    -- HRP в cam-space будет смещён на -1.75 по X.
+    -- Без ShiftLock: localHRP.X ≈ 0 (HRP по центру камеры).
+    if localHRP.X < -SHIFTLOCK_THRESHOLD then
+        -- ShiftLock активен: компенсируем offset
+        local worldOffset  = camCF:VectorToWorldSpace(SHIFTLOCK_OFFSET)
+        local correctedPos = camCF.Position - worldOffset
+        return CFrame.new(correctedPos) * (camCF - camCF.Position)
+    end
+    return camCF
 end
 -- ─────────────────────────────────────────────────────────────────────────────
 
@@ -313,9 +322,13 @@ local function SynchronizeConfigValues()
 end
 
 RunService:BindToRenderStep("ChinaHatVisuals", Enum.RenderPriority.Camera.Value + 1, function()
-    -- getCorrectedCamCF внутри проверяет IsMouseLocked() —
-    -- компенсация применяется ТОЛЬКО когда ShiftLock реально активен.
-    local camCF   = getCorrectedCamCF(camera.CFrame)
+    local rawCamCF = camera.CFrame
+    local hrpPos   = localCharacter
+        and localCharacter:FindFirstChild("HumanoidRootPart")
+        and localCharacter.HumanoidRootPart.Position
+    -- getCorrectedCamCF читает реальное смещение HRP в cam-space.
+    -- Не зависит от MouseLockController, работает с первого кадра.
+    local camCF   = getCorrectedCamCF(rawCamCF, hrpPos)
     local vpSize  = camera.ViewportSize
     local vpX,vpY = vpSize.X, vpSize.Y
     local tanFovY = math.tan(math.rad(camera.FieldOfView) * 0.5)
